@@ -22,7 +22,7 @@ RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
 STREAM_KEY = "PASTE_YOUR_TWITCH_KEY_HERE"
 RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
 
-WORKDIR = "/workspace/radio_data"
+WORKDIR = "/workspace/airadio/data"
 os.makedirs(WORKDIR, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
