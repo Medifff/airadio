@@ -1,16 +1,26 @@
+# Ядро
 torch>=2.6.0
 torchaudio
 torchvision
-transformers>=4.40.0
-diffusers
-accelerate
+
+# Stable Audio & DSP
+stable-audio-tools
+einops
+vector-quantize-pytorch
+scipy
 soundfile
 numpy
-scipy
+accelerate
+
+# Интерфейсы
+huggingface_hub
+transformers
+diffusers
+
+# Утилиты
 edge-tts
-sentencepiece
-protobuf
-# === Новое ===
+requests
 crewai
 langchain_openai
-requests
+protobuf
+sentencepiece
