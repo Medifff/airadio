@@ -1,6 +1,9 @@
-torch
-soundfile
 transformers
 diffusers
+accelerate
+soundfile
+numpy
 edge-tts
-nest_asyncio
+scipy
+sentencepiece
+protobuf
