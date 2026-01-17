@@ -10,30 +10,30 @@ import queue
 import asyncio
 import requests
 import torch
+import torchaudio
+from einops import rearrange
 from diffusers import StableDiffusionPipeline
 import edge_tts
 from crewai import Agent, Task, Crew
-
-# === НОВЫЕ ИМПОРТЫ ДЛЯ STABLE AUDIO ===
 from huggingface_hub import login
+
+# === ВАЖНО: Правильные импорты из официального примера ===
 from stable_audio_tools import get_pretrained_model
-from stable_audio_tools.inference import generate_diffusion_cond
+from stable_audio_tools.inference.generation import generate_diffusion_cond
 
 # =========================
 # 1. CONFIG & ENV
 # =========================
 os.environ["HF_HOME"] = "/workspace/hf_cache"
 
-# КЛЮЧИ
 STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN") # <--- ОБЯЗАТЕЛЬНО НУЖЕН!
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 if not STREAM_KEY:
     print("⚠️ WARNING: TWITCH_STREAM_KEY not found.")
 if not HF_TOKEN:
-    print("❌ CRITICAL: HF_TOKEN not found! Stable Audio won't download.")
-    # Если токена нет в ENV, попробуем войти интерактивно или упадем
+    print("❌ CRITICAL: HF_TOKEN not found! Model won't download.")
 else:
     print("🔑 Logging into HuggingFace...")
     login(token=HF_TOKEN)
@@ -45,8 +45,7 @@ os.makedirs(WORKDIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"⚙️ Device: {DEVICE}")
 
-# Очередь сегментов
-video_queue = queue.Queue(maxsize=3) # Уменьшил буфер до 3, т.к. генерация дольше
+video_queue = queue.Queue(maxsize=3)
 TRACKS_BEFORE_DJ = 3 
 
 # =========================
@@ -57,11 +56,13 @@ def cleanup():
     torch.cuda.empty_cache()
 
 print("⏳ Loading Stable Audio Open 1.0...")
-# Загружаем модель Stable Audio
-# Она тяжелая, поэтому сразу чистим память перед загрузкой
 cleanup()
-audio_model, audio_cfg = get_pretrained_model("stabilityai/stable-audio-open-1.0", device=DEVICE)
-audio_model.to(DEVICE).eval()
+# Используем get_pretrained_model как в примере
+audio_model, model_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
+sample_rate = model_config["sample_rate"]
+sample_size = model_config["sample_size"]
+
+audio_model = audio_model.to(DEVICE).eval()
 
 print("⏳ Loading Stable Diffusion...")
 sd_pipe = StableDiffusionPipeline.from_pretrained(
@@ -72,7 +73,7 @@ sd_pipe = StableDiffusionPipeline.from_pretrained(
 sd_pipe.safety_checker = None
 
 # =========================
-# 3. CREW AI & LOGIC
+# 3. CREW AI (DJ Logic)
 # =========================
 TECH_KEYWORDS = ["AI", "ML", "OpenAI", "LLM", "NVIDIA", "Robotics", "SpaceX", "Python", "Cyberpunk", "Neural"]
 
@@ -133,68 +134,58 @@ class CrewAIDJ:
 
 ai_dj = CrewAIDJ()
 
-# === НОВЫЕ ПРОМПТЫ ДЛЯ STABLE AUDIO (ЛЮБИТ СПИСКИ ЧЕРЕЗ ЗАПЯТУЮ) ===
+# =========================
+# 4. PROMPTS & AUDIO GEN
+# =========================
 def get_vibes():
     genres = [
-        (
-            "punk rock, fast tempo, distorted guitars, aggressive drums, high fidelity, studio recording, heavy bass", 
-            "punk rock poster, anarchy symbol, graffiti, red and black, grunge texture"
-        ),
-        (
-            "post-punk, dark wave, chorus guitar, driving bassline, melancholic, 80s goth vibe, reverb, atmospheric", 
-            "post-punk album cover, monochrome, brutalist architecture, dark fog"
-        ),
-        (
-            "happy hardcore, 170bpm, energetic piano, heavy kick drum, rave, dance, synthesizer, uplifting", 
-            "colorful rave party, lasers, neon rainbows, high energy"
-        ),
-        (
-            "electronic rock, industrial metal, distorted synths, powerful drums, cyberpunk action, cinematic", 
-            "cyberpunk rocker, neon guitar, futuristic city, glitch art"
-        ),
-        (
-            "drum and bass, liquid dnb, fast breakbeats, deep sub bass, atmospheric pads, soulful, melodic", 
-            "futuristic tunnel, speed lines, neon blue and orange, liquid fluid abstract"
-        )
+        ("punk rock, fast tempo, distorted guitars, aggressive drums, high fidelity, studio recording, heavy bass", 
+         "punk rock poster, anarchy symbol, graffiti, red and black, grunge texture"),
+        ("post-punk, dark wave, chorus guitar, driving bassline, melancholic, 80s goth vibe, reverb, atmospheric", 
+         "post-punk album cover, monochrome, brutalist architecture, dark fog"),
+        ("happy hardcore, 170bpm, energetic piano, heavy kick drum, rave, dance, synthesizer, uplifting", 
+         "colorful rave party, lasers, neon rainbows, high energy"),
+        ("electronic rock, industrial metal, distorted synths, powerful drums, cyberpunk action, cinematic", 
+         "cyberpunk rocker, neon guitar, futuristic city, glitch art"),
+        ("drum and bass, liquid dnb, fast breakbeats, deep sub bass, atmospheric pads, soulful, melodic", 
+         "futuristic tunnel, speed lines, neon blue and orange, liquid fluid abstract")
     ]
     return random.choice(genres)
 
-# =========================
-# 4. AUDIO GENERATION (STABLE AUDIO)
-# =========================
 def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
     print(f"🎧 StableAudio Generating: {prompt}...")
-    sample_rate = 44100
     
-    # Очищаем память перед тяжелой генерацией
-    cleanup()
+    cleanup() # Очистка памяти
     
+    # Кондиционирование из примера
+    conditioning = [{
+        "prompt": prompt,
+        "seconds_start": 0,
+        "seconds_total": duration_sec
+    }]
+
     with torch.no_grad():
-        audio = generate_diffusion_cond(
-            model=audio_model,
-            conditioning=[{
-                "prompt": prompt,
-                "seconds_start": 0,
-                "seconds_total": duration_sec
-            }],
-            steps=100,           # 100 шагов - баланс скорости/качества (можно 150, но будет медленнее)
-            cfg_scale=7.0,       # 7.0 дает хорошее следование промпту
-            sample_rate=sample_rate,
+        output = generate_diffusion_cond(
+            audio_model,
+            steps=100,
+            cfg_scale=7,
+            conditioning=conditioning,
+            sample_size=sample_size,
+            sigma_min=0.3,
+            sigma_max=500,
+            sampler_type="dpmpp-3m-sde", # Важный параметр для качества!
             device=DEVICE
         )
 
-    # Нормализация
-    audio = audio / audio.abs().max().clamp(min=1e-6)
-    audio = audio * 0.95 
+    # Пост-процессинг из официального примера
+    # Rearrange audio batch to a single sequence
+    output = rearrange(output, "b d n -> d (b n)")
 
-    # Сохранение (Транспонируем тензор, если нужно)
-    # Stable Audio выдает [1, 2, samples], torchaudio ожидает [channels, samples] - обычно ок
-    audio = audio.squeeze(0) # убираем batch dimension -> [2, samples]
+    # Peak normalize, clip, convert to int16, and save
+    # Используем torch.float32 для вычислений
+    output = output.to(torch.float32).div(torch.max(torch.abs(output))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
     
-    # Сохраняем через soundfile для надежности (torchaudio иногда капризничает с форматами на RunPod)
-    audio_np = audio.cpu().numpy().T # -> [samples, 2]
-    sf.write(out_wav, audio_np, sample_rate)
-    
+    torchaudio.save(out_wav, output, sample_rate)
     return sample_rate
 
 # =========================
@@ -206,19 +197,15 @@ def generate_segment(idx, is_dj_turn):
     
     music_prompt, visual_prompt = get_vibes()
     
-    # Файлы
     music_path = os.path.join(WORKDIR, f"temp_music_{idx}.wav")
     voice_path = os.path.join(WORKDIR, f"temp_voice_{idx}.wav") if is_dj_turn else None
     cover_path = os.path.join(WORKDIR, f"temp_cover_{idx}.png")
     final_video = os.path.join(WORKDIR, f"segment_{idx}.ts")
 
     # A. Generate Music (Stable Audio)
-    # Генерируем ~45-50 секунд (Stable Audio Open умеет до 47с)
     gen_music_stable_audio(music_prompt, music_path, duration_sec=45)
 
     # B. Generate Cover (SD)
-    # Чтобы не вылететь по памяти, можно выгрузить SD в CPU, если будет OOM,
-    # Но на 16GB должно влезть параллельно.
     with torch.no_grad():
         image = sd_pipe(f"{visual_prompt}, masterpiece, 8k", num_inference_steps=20).images[0]
     image.save(cover_path)
@@ -233,8 +220,6 @@ def generate_segment(idx, is_dj_turn):
     # D. Assembly
     f = sf.SoundFile(music_path)
     music_dur = len(f) / f.samplerate
-    # Stable Audio делает полноценный трек, его не обязательно лупить 3 раза
-    # Но для надежности залупим 2 раза, чтобы получить ~1.5 минуты эфира
     total_dur = music_dur * 2 
 
     cmd = ["ffmpeg", "-y", "-loglevel", "error"]
@@ -242,11 +227,10 @@ def generate_segment(idx, is_dj_turn):
     if is_dj_turn:
         cmd += ["-i", voice_path]
     
-    cmd += ["-stream_loop", "1", "-i", music_path] # loop 1 раз (играет 2 раза)
+    cmd += ["-stream_loop", "1", "-i", music_path] 
     cmd += ["-t", str(total_dur)]
 
     if is_dj_turn:
-        # Crossfade
         filter_str = "[1:a]volume=1.5[v];[2:a]volume=0.9[m];[v][m]amix=inputs=2:duration=longest:dropout_transition=2[mix];[mix]acompressor=ratio=4[aout]"
     else:
         filter_str = "[1:a]volume=1.0,acompressor=ratio=4[aout]"
@@ -293,7 +277,6 @@ def worker_thread():
 # =========================
 def streamer_thread():
     print("📡 Streamer started. Buffering...")
-    # Ждем 1 готовый сегмент. Stable Audio медленный, поэтому буфер набирается дольше.
     while video_queue.qsize() < 1:
         time.sleep(5)
     print("🔴 GOING LIVE!")
