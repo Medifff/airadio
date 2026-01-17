@@ -1,19 +1,16 @@
-# --- Ядро (Обновляем принудительно из-за ошибки безопасности) ---
 torch>=2.6.0
 torchaudio
 torchvision
-
-# --- Нейросети ---
 transformers>=4.40.0
 diffusers
 accelerate
-
-# --- Аудио и обработка ---
 soundfile
 numpy
 scipy
-
-# --- Голос и утилиты ---
 edge-tts
 sentencepiece
 protobuf
+# === Новое ===
+crewai
+langchain_openai
+requests
