@@ -9,17 +9,13 @@ from transformers import MusicgenForConditionalGeneration, MusicgenProcessor
 from diffusers import StableDiffusionPipeline
 import edge_tts
 
+# =========================
+# ENV / CONFIG
+# =========================
 STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
-
 if not STREAM_KEY:
     raise RuntimeError("TWITCH_STREAM_KEY is not set")
 
-RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
-
-# =========================
-# CONFIG
-# =========================
-STREAM_KEY = "PASTE_YOUR_TWITCH_KEY_HERE"
 RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
 
 WORKDIR = "/workspace/airadio/data"
@@ -29,13 +25,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"⚙️ Device: {DEVICE}")
 
 # =========================
-# LOAD MODELS (ONCE)
+# LOAD MODELS
 # =========================
 print("⏳ Loading MusicGen...")
 processor = MusicgenProcessor.from_pretrained("facebook/musicgen-small")
 music_model = MusicgenForConditionalGeneration.from_pretrained(
-    "facebook/musicgen-small"
+    "facebook/musicgen-small",
+    torch_dtype=torch.float32
 ).to(DEVICE)
+music_model.eval()
 
 print("⏳ Loading Stable Diffusion...")
 sd = StableDiffusionPipeline.from_pretrained(
@@ -70,126 +68,25 @@ def cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-def gen_music(prompt, out_wav):
-    inputs = processor(text=[prompt], return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        audio = music_model.generate(**inputs, max_new_tokens=1000)
-    sr = music_model.config.audio_encoder.sampling_rate
-    sf.write(out_wav, audio[0, 0].cpu().numpy(), sr)
-
-def gen_cover(prompt, out_png):
-    with torch.no_grad():
-        img = sd(prompt, num_inference_steps=12).images[0]
-    img.save(out_png)
-
-async def gen_voice(text, out_wav):
-    tts = edge_tts.Communicate(text, "en-US-ChristopherNeural")
-    await tts.save(out_wav)
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
 # =========================
-# SEGMENT GENERATION
+# GENERATORS
 # =========================
-def make_segment(idx):
-    print(f"\n🎶 Generating segment {idx}")
-
-    music_prompt = random.choice(MUSIC_PROMPTS)
-    dj_text = random.choice(DJ_PHRASES)
-
-    music_wav = f"{WORKDIR}/music_{idx}.wav"
-    voice_wav = f"{WORKDIR}/voice_{idx}.wav"
-    cover_png = f"{WORKDIR}/cover_{idx}.png"
-    segment_mp4 = f"{WORKDIR}/segment_{idx}.mp4"
-
-    # Generate assets
-    gen_music(music_prompt, music_wav)
-    gen_cover(f"{music_prompt}, digital art, cinematic, 4k", cover_png)
-
-    import asyncio
-    asyncio.run(gen_voice(dj_text, voice_wav))
-
-    # Duration
-    f = sf.SoundFile(music_wav)
-    duration = (len(f) / f.samplerate) * 3 - 1  # loop music x3
-
-    # Build segment video
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", cover_png,
-        "-i", voice_wav,
-        "-stream_loop", "2", "-i", music_wav,
-        "-t", str(duration),
-        "-filter_complex",
-        "[1:a]volume=1.4[v];"
-        "[2:a]volume=0.8[m];"
-        "[v][m]amix=inputs=2:duration=longest[a];"
-        "[0:v]scale=1280:720,format=yuv420p[vout]",
-        "-map", "[vout]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-r", "30", "-g", "60",
-        "-c:a", "aac", "-b:a", "160k",
-        segment_mp4
-    ]
-
-    subprocess.run(cmd, check=True)
-
-    # Cleanup
-    for f in [music_wav, voice_wav, cover_png]:
-        if os.path.exists(f):
-            os.remove(f)
-
+def gen_music(prompt, out_wav, retries=3):
     cleanup()
-    return segment_mp4
+    inputs = processor(text=[prompt], return_tensors="pt").to(DEVICE)
 
-# =========================
-# MAIN STREAM LOOP
-# =========================
-def run_radio():
-    print("\n🚀 Starting AI Radio")
-
-    # Start ffmpeg stream (stdin = mp4 chunks)
-    stream_cmd = [
-        "ffmpeg", "-re",
-        "-f", "concat", "-safe", "0",
-        "-i", "-",             # read file list from stdin
-        "-c", "copy",
-        "-f", "flv",
-        RTMP_URL
-    ]
-
-    ffmpeg = subprocess.Popen(
-        stream_cmd,
-        stdin=subprocess.PIPE
-    )
-
-    idx = 0
-    playlist = []
-
-    try:
-        while True:
-            # Keep buffer of 2 segments
-            while len(playlist) < 2:
-                seg = make_segment(idx)
-                playlist.append(seg)
-                idx += 1
-
-            # Send next segment
-            seg = playlist.pop(0)
-            print(f"📡 Streaming: {seg}")
-
-            # FFmpeg concat protocol input
-            ffmpeg.stdin.write(f"file '{seg}'\n".encode())
-            ffmpeg.stdin.flush()
-
-            # Let it play roughly its duration
-            time.sleep(5)
-
-            if os.path.exists(seg):
-                os.remove(seg)
-
-    except KeyboardInterrupt:
-        print("🛑 Stopping radio")
-        ffmpeg.kill()
-
-if __name__ == "__main__":
-    run_radio()
+    for attempt in range(retries):
+        try:
+            with torch.no_grad():
+                audio = music_model.generate(
+                    **inputs,
+                    max_new_tokens=700,
+                    do_sample=False
+                )
+            sr = music_model.config.audio_encoder.sampling_rate
+            sf.write(out_wav, audio[0,]()_
