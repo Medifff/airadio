@@ -1,0 +1,6 @@
+torch
+soundfile
+transformers
+diffusers
+edge-tts
+nest_asyncio
