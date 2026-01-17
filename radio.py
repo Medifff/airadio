@@ -10,24 +10,33 @@ import queue
 import asyncio
 import requests
 import torch
-from transformers import MusicgenForConditionalGeneration, MusicgenProcessor
 from diffusers import StableDiffusionPipeline
 import edge_tts
 from crewai import Agent, Task, Crew
+
+# === НОВЫЕ ИМПОРТЫ ДЛЯ STABLE AUDIO ===
+from huggingface_hub import login
+from stable_audio_tools import get_pretrained_model
+from stable_audio_tools.inference import generate_diffusion_cond
 
 # =========================
 # 1. CONFIG & ENV
 # =========================
 os.environ["HF_HOME"] = "/workspace/hf_cache"
 
-# Ключи
+# КЛЮЧИ
 STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+HF_TOKEN = os.environ.get("HF_TOKEN") # <--- ОБЯЗАТЕЛЬНО НУЖЕН!
 
 if not STREAM_KEY:
     print("⚠️ WARNING: TWITCH_STREAM_KEY not found.")
-if not OPENAI_API_KEY:
-    print("⚠️ WARNING: OPENAI_API_KEY not found. DJ will be dumb (fallback mode).")
+if not HF_TOKEN:
+    print("❌ CRITICAL: HF_TOKEN not found! Stable Audio won't download.")
+    # Если токена нет в ENV, попробуем войти интерактивно или упадем
+else:
+    print("🔑 Logging into HuggingFace...")
+    login(token=HF_TOKEN)
 
 RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
 WORKDIR = "/workspace/airadio/data"
@@ -37,8 +46,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"⚙️ Device: {DEVICE}")
 
 # Очередь сегментов
-video_queue = queue.Queue(maxsize=4)
-TRACKS_BEFORE_DJ = 3  # DJ говорит раз в 3 трека
+video_queue = queue.Queue(maxsize=3) # Уменьшил буфер до 3, т.к. генерация дольше
+TRACKS_BEFORE_DJ = 3 
 
 # =========================
 # 2. LOAD MODELS
@@ -47,14 +56,12 @@ def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
 
-print("⏳ Loading MusicGen Medium...")
-processor = MusicgenProcessor.from_pretrained("facebook/musicgen-medium")
-music_model = MusicgenForConditionalGeneration.from_pretrained(
-    "facebook/musicgen-medium",
-    torch_dtype=torch.float32, 
-    use_safetensors=True
-).to(DEVICE)
-music_model.eval()
+print("⏳ Loading Stable Audio Open 1.0...")
+# Загружаем модель Stable Audio
+# Она тяжелая, поэтому сразу чистим память перед загрузкой
+cleanup()
+audio_model, audio_cfg = get_pretrained_model("stabilityai/stable-audio-open-1.0", device=DEVICE)
+audio_model.to(DEVICE).eval()
 
 print("⏳ Loading Stable Diffusion...")
 sd_pipe = StableDiffusionPipeline.from_pretrained(
@@ -65,12 +72,11 @@ sd_pipe = StableDiffusionPipeline.from_pretrained(
 sd_pipe.safety_checker = None
 
 # =========================
-# 3. NEWS & CREW AI
+# 3. CREW AI & LOGIC
 # =========================
 TECH_KEYWORDS = ["AI", "ML", "OpenAI", "LLM", "NVIDIA", "Robotics", "SpaceX", "Python", "Cyberpunk", "Neural"]
 
 def fetch_tech_news():
-    """Парсит Hacker News по теме AI"""
     try:
         r = requests.get(
             "https://hn.algolia.com/api/v1/search_by_date",
@@ -93,11 +99,7 @@ class CrewAIDJ:
         self.agent = Agent(
             role="Cyberpunk Radio Host",
             goal="Deliver short, cool updates about technology between music tracks.",
-            backstory=(
-                "You are 'Nexus', an AI host on a futuristic radio station playing Punk and Electronic Rock. "
-                "Your voice is energetic but professional. "
-                "You love technology, code, and the future. You never talk about politics."
-            ),
+            backstory="You are 'Nexus', an AI host on a futuristic radio station playing Punk and Electronic Rock.",
             verbose=False,
             allow_delegation=False
         )
@@ -111,20 +113,15 @@ class CrewAIDJ:
 
         task = Task(
             description=f"""
-            You are live on air.
-            Current Mood: {mood} (Punk/Electronic/Hardcore)
-            
-            Latest Tech Headlines:
-            - {news_str}
-            
+            Live on air. Mood: {mood}.
+            Tech Headlines: {news_str}
             Instructions:
-            1. Choose ONE headline to mention briefly OR just talk about the digital revolution.
-            2. Keep it under 3 sentences.
-            3. Be cool, concise, and energetic. Match the high energy of the music.
-            4. Smoothly introduce the next track.
+            1. Mention one headline briefly.
+            2. Be cool, concise, energetic.
+            3. Under 3 sentences.
             """,
             agent=self.agent,
-            expected_output="A short text script for the DJ to read."
+            expected_output="Short DJ script."
         )
 
         crew = Crew(agents=[self.agent], tasks=[task])
@@ -136,53 +133,78 @@ class CrewAIDJ:
 
 ai_dj = CrewAIDJ()
 
-# === ГЛАВНОЕ ОБНОВЛЕНИЕ: НОВЫЕ ЖАНРЫ И ПРОМПТЫ ===
+# === НОВЫЕ ПРОМПТЫ ДЛЯ STABLE AUDIO (ЛЮБИТ СПИСКИ ЧЕРЕЗ ЗАПЯТУЮ) ===
 def get_vibes():
-    # Чтобы не звучало как "Атари", добавляем: "high quality, studio recording, real instruments"
     genres = [
         (
-            "fast tempo punk rock, distorted electric guitars, energetic live drums, rebellion, high fidelity, studio recording", 
-            "punk rock poster, anarchy symbol, graffiti, red and black, grunge texture, chaotic"
+            "punk rock, fast tempo, distorted guitars, aggressive drums, high fidelity, studio recording, heavy bass", 
+            "punk rock poster, anarchy symbol, graffiti, red and black, grunge texture"
         ),
         (
-            "post-punk, dark wave, chorus guitar, driving bassline, melancholic, 80s goth vibe, high quality", 
-            "post-punk album cover, monochrome, grainy, brutalist architecture, dark fog, mysterious"
+            "post-punk, dark wave, chorus guitar, driving bassline, melancholic, 80s goth vibe, reverb, atmospheric", 
+            "post-punk album cover, monochrome, brutalist architecture, dark fog"
         ),
         (
-            "happy hardcore, uk hardcore, 170bpm, uplifting piano melody, heavy kick drum, energetic rave, dance", 
-            "colorful rave party, lasers, anime aesthetic, neon rainbows, high energy, smiley face"
+            "happy hardcore, 170bpm, energetic piano, heavy kick drum, rave, dance, synthesizer, uplifting", 
+            "colorful rave party, lasers, neon rainbows, high energy"
         ),
         (
-            "electronic rock, industrial metal, heavy guitar riffs mixed with distorted synths, powerful drums, cyberpunk action", 
-            "cyberpunk rocker, neon guitar, futuristic city, glitch art, aggressive style, blue and purple"
+            "electronic rock, industrial metal, distorted synths, powerful drums, cyberpunk action, cinematic", 
+            "cyberpunk rocker, neon guitar, futuristic city, glitch art"
         ),
         (
-            "alternative rock, grunge, dirty guitar tone, heavy drums, energetic, 90s style, band recording", 
-            "grunge aesthetic, flannel shirt, distorted tv static, garage band, moody lighting"
+            "drum and bass, liquid dnb, fast breakbeats, deep sub bass, atmospheric pads, soulful, melodic", 
+            "futuristic tunnel, speed lines, neon blue and orange, liquid fluid abstract"
         )
     ]
     return random.choice(genres)
 
 # =========================
-# 4. AUDIO PROCESSING
+# 4. AUDIO GENERATION (STABLE AUDIO)
 # =========================
-def save_audio_normalized(audio_tensor, filename, sr):
-    audio_np = audio_tensor[0, 0].cpu().float().numpy()
-    max_val = np.max(np.abs(audio_np))
-    if max_val > 0:
-        # Чуть уменьшил громкость (0.9 -> 0.85), чтобы дисторшн в панк-роке не клипповал
-        audio_np = audio_np / max_val * 0.85
-    sf.write(filename, audio_np, sr, subtype='PCM_16')
+def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
+    print(f"🎧 StableAudio Generating: {prompt}...")
+    sample_rate = 44100
+    
+    # Очищаем память перед тяжелой генерацией
+    cleanup()
+    
+    with torch.no_grad():
+        audio = generate_diffusion_cond(
+            model=audio_model,
+            conditioning=[{
+                "prompt": prompt,
+                "seconds_start": 0,
+                "seconds_total": duration_sec
+            }],
+            steps=100,           # 100 шагов - баланс скорости/качества (можно 150, но будет медленнее)
+            cfg_scale=7.0,       # 7.0 дает хорошее следование промпту
+            sample_rate=sample_rate,
+            device=DEVICE
+        )
+
+    # Нормализация
+    audio = audio / audio.abs().max().clamp(min=1e-6)
+    audio = audio * 0.95 
+
+    # Сохранение (Транспонируем тензор, если нужно)
+    # Stable Audio выдает [1, 2, samples], torchaudio ожидает [channels, samples] - обычно ок
+    audio = audio.squeeze(0) # убираем batch dimension -> [2, samples]
+    
+    # Сохраняем через soundfile для надежности (torchaudio иногда капризничает с форматами на RunPod)
+    audio_np = audio.cpu().numpy().T # -> [samples, 2]
+    sf.write(out_wav, audio_np, sample_rate)
+    
+    return sample_rate
 
 # =========================
-# 5. WORKER (GENERATOR)
+# 5. WORKER
 # =========================
 def generate_segment(idx, is_dj_turn):
     print(f"\n🔨 [Worker] Processing segment {idx} (DJ Turn: {is_dj_turn})...")
     t0 = time.time()
     
     music_prompt, visual_prompt = get_vibes()
-    print(f"🎵 Genre: {music_prompt.split(',')[0]}...")
     
     # Файлы
     music_path = os.path.join(WORKDIR, f"temp_music_{idx}.wav")
@@ -190,43 +212,42 @@ def generate_segment(idx, is_dj_turn):
     cover_path = os.path.join(WORKDIR, f"temp_cover_{idx}.png")
     final_video = os.path.join(WORKDIR, f"segment_{idx}.ts")
 
-    # A. MusicGen
-    inputs = processor(text=[music_prompt], padding=True, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        # guidance_scale=3.5 дает более четкое следование жанру
-        audio_values = music_model.generate(**inputs, max_new_tokens=1000, guidance_scale=3.5)
-    save_audio_normalized(audio_values, music_path, music_model.config.audio_encoder.sampling_rate)
+    # A. Generate Music (Stable Audio)
+    # Генерируем ~45-50 секунд (Stable Audio Open умеет до 47с)
+    gen_music_stable_audio(music_prompt, music_path, duration_sec=45)
 
-    # B. Stable Diffusion
+    # B. Generate Cover (SD)
+    # Чтобы не вылететь по памяти, можно выгрузить SD в CPU, если будет OOM,
+    # Но на 16GB должно влезть параллельно.
     with torch.no_grad():
-        image = sd_pipe(f"{visual_prompt}, masterpiece, 8k, detailed", num_inference_steps=20).images[0]
+        image = sd_pipe(f"{visual_prompt}, masterpiece, 8k", num_inference_steps=20).images[0]
     image.save(cover_path)
 
-    # C. TTS (Только если очередь DJ)
+    # C. TTS
     if is_dj_turn:
-        # Передаем настроение трека DJ-ю, чтобы он подстроился
         mood = music_prompt.split(",")[0]
         dj_text = ai_dj.generate_script(mood=mood)
         print(f"🗣️ DJ Says: {dj_text}")
         asyncio.run(edge_tts.Communicate(dj_text, "en-US-ChristopherNeural").save(voice_path))
 
-    # D. FFmpeg Assembly
+    # D. Assembly
     f = sf.SoundFile(music_path)
     music_dur = len(f) / f.samplerate
-    total_dur = music_dur * 3  
+    # Stable Audio делает полноценный трек, его не обязательно лупить 3 раза
+    # Но для надежности залупим 2 раза, чтобы получить ~1.5 минуты эфира
+    total_dur = music_dur * 2 
 
     cmd = ["ffmpeg", "-y", "-loglevel", "error"]
-    
-    cmd += ["-loop", "1", "-i", cover_path]          # 0
+    cmd += ["-loop", "1", "-i", cover_path]
     if is_dj_turn:
-        cmd += ["-i", voice_path]                    # 1
+        cmd += ["-i", voice_path]
     
-    cmd += ["-stream_loop", "-1", "-i", music_path]  # 1 или 2
+    cmd += ["-stream_loop", "1", "-i", music_path] # loop 1 раз (играет 2 раза)
     cmd += ["-t", str(total_dur)]
 
     if is_dj_turn:
-        # Громкая музыка (0.8) + Громкий голос (1.5) + Компрессор, чтобы качало
-        filter_str = "[1:a]volume=1.5[v];[2:a]volume=0.85[m];[v][m]amix=inputs=2:duration=longest:dropout_transition=2[mix];[mix]acompressor=ratio=4[aout]"
+        # Crossfade
+        filter_str = "[1:a]volume=1.5[v];[2:a]volume=0.9[m];[v][m]amix=inputs=2:duration=longest:dropout_transition=2[mix];[mix]acompressor=ratio=4[aout]"
     else:
         filter_str = "[1:a]volume=1.0,acompressor=ratio=4[aout]"
 
@@ -250,7 +271,6 @@ def generate_segment(idx, is_dj_turn):
 def worker_thread():
     idx = 0
     tracks_since_dj = 0
-    
     while True:
         if video_queue.full():
             time.sleep(1)
@@ -259,13 +279,11 @@ def worker_thread():
             is_dj_turn = (tracks_since_dj >= TRACKS_BEFORE_DJ)
             seg_path = generate_segment(idx, is_dj_turn)
             video_queue.put(seg_path)
-            
             idx += 1
             if is_dj_turn:
                 tracks_since_dj = 0
             else:
                 tracks_since_dj += 1
-                
         except Exception as e:
             print(f"❌ Worker Error: {e}")
             time.sleep(5)
@@ -275,8 +293,9 @@ def worker_thread():
 # =========================
 def streamer_thread():
     print("📡 Streamer started. Buffering...")
+    # Ждем 1 готовый сегмент. Stable Audio медленный, поэтому буфер набирается дольше.
     while video_queue.qsize() < 1:
-        time.sleep(2)
+        time.sleep(5)
     print("🔴 GOING LIVE!")
 
     stream_cmd = [
@@ -308,9 +327,6 @@ def streamer_thread():
         if os.path.exists(seg_path):
             os.remove(seg_path)
 
-# =========================
-# MAIN
-# =========================
 if __name__ == "__main__":
     t_worker = threading.Thread(target=worker_thread, daemon=True)
     t_worker.start()
