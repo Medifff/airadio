@@ -1,30 +1,57 @@
 import os
+import torch
+from transformers import MusicgenForConditionalGeneration, MusicgenProcessor
+
+# === FIX 1: ЛЕЧИМ НЕХВАТКУ МЕСТА ===
+# Переносим кэш моделей на большой диск (/workspace)
+os.environ["HF_HOME"] = "/workspace/hf_cache"
+
+# Остальные импорты
 import time
 import random
 import subprocess
 import gc
-import torch
 import soundfile as sf
 import numpy as np
 import threading
 import queue
 import asyncio
-from transformers import MusicgenForConditionalGeneration, MusicgenProcessor
 from diffusers import StableDiffusionPipeline
 import edge_tts
 
 # =========================
 # CONFIG
 # =========================
-# Убедись, что переменная окружения задана в RunPod, или вставь ключ сюда
-STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY") 
+STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
 if not STREAM_KEY:
-    print("⚠️ WARNING: TWITCH_STREAM_KEY not found. Stream will fail.")
-    # STREAM_KEY = "live_xxxx_....." # Раскомментируй и вставь, если лень через env
+    print("⚠️ WARNING: TWITCH_STREAM_KEY not found.")
+    # STREAM_KEY = "твои_цифры..." 
 
 RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
 WORKDIR = "/workspace/airadio/data"
 os.makedirs(WORKDIR, exist_ok=True)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"⚙️ Device: {DEVICE}")
+
+# Очередь
+video_queue = queue.Queue(maxsize=5)
+
+# =========================
+# LOAD MODELS (С ИСПРАВЛЕНИЯМИ)
+# =========================
+print("⏳ Loading MusicGen Medium (High Quality)...")
+
+# === FIX 2: ЛЕЧИМ ОШИБКУ TORCH ===
+# Добавляем use_safetensors=True, чтобы обойти ошибку pickle/torch.load
+processor = MusicgenProcessor.from_pretrained("facebook/musicgen-medium")
+music_model = MusicgenForConditionalGeneration.from_pretrained(
+    "facebook/musicgen-medium",
+    torch_dtype=torch.float16,
+    use_safetensors=True,  
+    variant="fp16"         
+).to(DEVICE)
+music_model.eval()
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"⚙️ Device: {DEVICE} (RTX A4000 Power!)")
