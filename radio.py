@@ -89,4 +89,112 @@ def gen_music(prompt, out_wav, retries=3):
                     do_sample=False
                 )
             sr = music_model.config.audio_encoder.sampling_rate
-            sf.write(out_wav, audio[0,]()_
+            sf.write(out_wav, audio[0, 0].cpu().numpy(), sr)
+            return
+        except RuntimeError as e:
+            print(f"⚠️ MusicGen failed ({attempt+1}/{retries}): {e}")
+            cleanup()
+            time.sleep(2)
+
+    raise RuntimeError("MusicGen failed after retries")
+
+def gen_cover(prompt, out_png):
+    with torch.no_grad():
+        img = sd(prompt, num_inference_steps=12).images[0]
+    img.save(out_png)
+
+async def gen_voice(text, out_wav):
+    tts = edge_tts.Communicate(text, "en-US-ChristopherNeural")
+    await tts.save(out_wav)
+
+# =========================
+# SEGMENT CREATION
+# =========================
+def make_segment(idx):
+    print(f"\n🎶 Generating segment {idx}")
+
+    music_prompt = random.choice(MUSIC_PROMPTS)
+    dj_text = random.choice(DJ_PHRASES)
+
+    music_wav = f"{WORKDIR}/music_{idx}.wav"
+    voice_wav = f"{WORKDIR}/voice_{idx}.wav"
+    cover_png = f"{WORKDIR}/cover_{idx}.png"
+    segment_mp4 = f"{WORKDIR}/segment_{idx}.mp4"
+
+    gen_music(music_prompt, music_wav)
+    gen_cover(f"{music_prompt}, digital art, cinematic, 4k", cover_png)
+
+    import asyncio
+    asyncio.run(gen_voice(dj_text, voice_wav))
+
+    f = sf.SoundFile(music_wav)
+    duration = (len(f) / f.samplerate) * 3 - 1
+
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "warning",
+        "-loop", "1", "-i", cover_png,
+        "-i", voice_wav,
+        "-stream_loop", "2", "-i", music_wav,
+        "-t", str(duration),
+        "-filter_complex",
+        "[1:a]volume=1.4[v];"
+        "[2:a]volume=0.8[m];"
+        "[v][m]amix=inputs=2:duration=longest[a];"
+        "[0:v]scale=1280:720,format=yuv420p[vout]",
+        "-map", "[vout]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-r", "30", "-g", "60",
+        "-c:a", "aac", "-b:a", "160k",
+        segment_mp4
+    ]
+
+    subprocess.run(cmd, check=True)
+
+    for f in [music_wav, voice_wav, cover_png]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    cleanup()
+    return segment_mp4
+
+# =========================
+# MAIN LOOP
+# =========================
+def run_radio():
+    print("\n🚀 Starting AI Radio")
+
+    idx = 0
+    buffer = []
+
+    while True:
+        while len(buffer) < 2:
+            seg = make_segment(idx)
+            buffer.append(seg)
+            idx += 1
+
+        seg = buffer.pop(0)
+        print(f"📡 Streaming: {seg}")
+
+        stream_cmd = [
+            "ffmpeg", "-re", "-loglevel", "warning",
+            "-i", seg,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
+            "-f", "flv",
+            "-rtmp_live", "live",
+            "-flvflags", "no_duration_filesize",
+            RTMP_URL
+        ]
+
+        subprocess.run(stream_cmd)
+
+        if os.path.exists(seg):
+            os.remove(seg)
+
+        cleanup()
+
+# =========================
+# ENTRYPOINT
+# =========================
+if __name__ == "__main__":
+    run_radio()
