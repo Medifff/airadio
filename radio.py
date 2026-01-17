@@ -17,7 +17,7 @@ import edge_tts
 from crewai import Agent, Task, Crew
 from huggingface_hub import login
 
-# === ВАЖНО: Правильные импорты из официального примера ===
+# === OFFICIAL IMPORTS ===
 from stable_audio_tools import get_pretrained_model
 from stable_audio_tools.inference.generation import generate_diffusion_cond
 
@@ -33,9 +33,8 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 if not STREAM_KEY:
     print("⚠️ WARNING: TWITCH_STREAM_KEY not found.")
 if not HF_TOKEN:
-    print("❌ CRITICAL: HF_TOKEN not found! Model won't download.")
+    print("❌ CRITICAL: HF_TOKEN not found!")
 else:
-    print("🔑 Logging into HuggingFace...")
     login(token=HF_TOKEN)
 
 RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
@@ -57,11 +56,9 @@ def cleanup():
 
 print("⏳ Loading Stable Audio Open 1.0...")
 cleanup()
-# Используем get_pretrained_model как в примере
 audio_model, model_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
 sample_rate = model_config["sample_rate"]
 sample_size = model_config["sample_size"]
-
 audio_model = audio_model.to(DEVICE).eval()
 
 print("⏳ Loading Stable Diffusion...")
@@ -135,29 +132,30 @@ class CrewAIDJ:
 ai_dj = CrewAIDJ()
 
 # =========================
-# 4. PROMPTS & AUDIO GEN
+# 4. PROMPTS & AUDIO GEN (UPDATED)
 # =========================
 def get_vibes():
+    # 📌 Suggestion 3: Studio Quality Prompts
+    quality_suffix = ", high quality studio recording, clear stereo image, professional mix, no fade out, continuous groove"
+    
     genres = [
-        ("punk rock, fast tempo, distorted guitars, aggressive drums, high fidelity, studio recording, heavy bass", 
+        (f"punk rock, fast tempo, distorted electric guitars, live drum kit, real bass guitar, energetic performance{quality_suffix}", 
          "punk rock poster, anarchy symbol, graffiti, red and black, grunge texture"),
-        ("post-punk, dark wave, chorus guitar, driving bassline, melancholic, 80s goth vibe, reverb, atmospheric", 
+        (f"post-punk, dark wave, chorus guitar, driving bassline, melancholic, 80s goth vibe, atmospheric{quality_suffix}", 
          "post-punk album cover, monochrome, brutalist architecture, dark fog"),
-        ("happy hardcore, 170bpm, energetic piano, heavy kick drum, rave, dance, synthesizer, uplifting", 
+        (f"happy hardcore, 170bpm, energetic piano, heavy kick drum, rave, dance, synthesizer, uplifting{quality_suffix}", 
          "colorful rave party, lasers, neon rainbows, high energy"),
-        ("electronic rock, industrial metal, distorted synths, powerful drums, cyberpunk action, cinematic", 
+        (f"electronic rock, industrial metal, distorted synths, powerful drums, cyberpunk action, cinematic{quality_suffix}", 
          "cyberpunk rocker, neon guitar, futuristic city, glitch art"),
-        ("drum and bass, liquid dnb, fast breakbeats, deep sub bass, atmospheric pads, soulful, melodic", 
+        (f"drum and bass, liquid dnb, fast breakbeats, deep sub bass, atmospheric pads, soulful, melodic{quality_suffix}", 
          "futuristic tunnel, speed lines, neon blue and orange, liquid fluid abstract")
     ]
     return random.choice(genres)
 
 def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
-    print(f"🎧 StableAudio Generating: {prompt}...")
+    print(f"🎧 StableAudio: {prompt[:30]}...")
+    cleanup()
     
-    cleanup() # Очистка памяти
-    
-    # Кондиционирование
     conditioning = [{
         "prompt": prompt,
         "seconds_start": 0,
@@ -167,8 +165,8 @@ def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
     with torch.no_grad():
         output = generate_diffusion_cond(
             audio_model,
-            steps=100,
-            cfg_scale=7,
+            steps=150,          # 📌 Suggestion 4: Quality Steps
+            cfg_scale=5.5,      # 📌 Suggestion 4: Musicality Sweet Spot
             conditioning=conditioning,
             sample_size=sample_size,
             sigma_min=0.3,
@@ -177,41 +175,33 @@ def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
             device=DEVICE
         )
 
-    # 1. Rearrange audio batch to a single sequence [channels, samples]
     output = rearrange(output, "b d n -> d (b n)")
-
-    # 2. Normalize to [-1, 1] (Float32)
-    # Важно: не конвертируем в int16 вручную, soundfile сделает это сам лучше
     output = output.to(torch.float32).div(torch.max(torch.abs(output))).clamp(-1, 1)
-
-    # 3. Convert to NumPy & Transpose
-    # SoundFile ожидает формат [samples, channels], а не наоборот, поэтому .T
     audio_np = output.cpu().numpy().T 
-    
-    # 4. Save using SoundFile (Это решает ошибку TorchCodec!)
-    # subtype='PCM_16' гарантирует стандартный формат WAV
     sf.write(out_wav, audio_np, sample_rate, subtype='PCM_16')
-    
     return sample_rate
 
 # =========================
-# 5. WORKER
+# 5. WORKER (PRO AUDIO CHAIN)
 # =========================
 def generate_segment(idx, is_dj_turn):
-    print(f"\n🔨 [Worker] Processing segment {idx} (DJ Turn: {is_dj_turn})...")
+    print(f"\n🔨 [Worker] Seg {idx} | DJ: {is_dj_turn}")
     t0 = time.time()
     
     music_prompt, visual_prompt = get_vibes()
     
-    music_path = os.path.join(WORKDIR, f"temp_music_{idx}.wav")
+    music_part1 = os.path.join(WORKDIR, f"temp_music_{idx}_1.wav")
+    music_part2 = os.path.join(WORKDIR, f"temp_music_{idx}_2.wav")
     voice_path = os.path.join(WORKDIR, f"temp_voice_{idx}.wav") if is_dj_turn else None
     cover_path = os.path.join(WORKDIR, f"temp_cover_{idx}.png")
     final_video = os.path.join(WORKDIR, f"segment_{idx}.ts")
 
-    # A. Generate Music (Stable Audio)
-    gen_music_stable_audio(music_prompt, music_path, duration_sec=45)
+    # A. Generate Music (Два куска по 45с, чтобы обойти лимит 47с модели)
+    # Это дает нам ~85 секунд уникального контента без лупов
+    gen_music_stable_audio(music_prompt, music_part1, duration_sec=45)
+    gen_music_stable_audio(music_prompt, music_part2, duration_sec=45)
 
-    # B. Generate Cover (SD)
+    # B. Generate Cover
     with torch.no_grad():
         image = sd_pipe(f"{visual_prompt}, masterpiece, 8k", num_inference_steps=20).images[0]
     image.save(cover_path)
@@ -220,30 +210,52 @@ def generate_segment(idx, is_dj_turn):
     if is_dj_turn:
         mood = music_prompt.split(",")[0]
         dj_text = ai_dj.generate_script(mood=mood)
-        print(f"🗣️ DJ Says: {dj_text}")
+        print(f"🗣️ DJ: {dj_text}")
         asyncio.run(edge_tts.Communicate(dj_text, "en-US-ChristopherNeural").save(voice_path))
 
-    # D. Assembly
-    f = sf.SoundFile(music_path)
-    music_dur = len(f) / f.samplerate
-    total_dur = music_dur * 2 
+    # D. FFmpeg Pro Mastering
+    # Мы склеиваем два трека кроссфейдом, чтобы звучало как один длинный (87 сек)
+    total_dur = 85 
 
     cmd = ["ffmpeg", "-y", "-loglevel", "error"]
-    cmd += ["-loop", "1", "-i", cover_path]
-    if is_dj_turn:
-        cmd += ["-i", voice_path]
+    cmd += ["-loop", "1", "-i", cover_path]      # [0] Image
     
-    cmd += ["-stream_loop", "1", "-i", music_path] 
-    cmd += ["-t", str(total_dur)]
-
     if is_dj_turn:
-        filter_str = "[1:a]volume=1.5[v];[2:a]volume=0.9[m];[v][m]amix=inputs=2:duration=longest:dropout_transition=2[mix];[mix]acompressor=ratio=4[aout]"
-    else:
-        filter_str = "[1:a]volume=1.0,acompressor=ratio=4[aout]"
+        cmd += ["-i", voice_path]                # [1] Voice
+    
+    cmd += ["-i", music_part1]                   # [2] Music A
+    cmd += ["-i", music_part2]                   # [3] Music B
 
-    cmd += ["-filter_complex", filter_str]
+    filter_complex = []
+    
+    # Индексы меняются в зависимости от того, есть ли голос
+    idx_m1 = "2" if is_dj_turn else "1"
+    idx_m2 = "3" if is_dj_turn else "2"
+    
+    # 1. Склейка музыки (Crossfade) - создает "Continuous groove"
+    filter_complex.append(f"[{idx_m1}:a][{idx_m2}:a]acrossfade=d=3:c1=tri:c2=tri[music_raw]")
+    
+    if is_dj_turn:
+        # 📌 Suggestion 2: Professional Voice Processing
+        # Highpass 100Hz (убрать гул), Lowpass 7000Hz (убрать свист), Comp
+        filter_complex.append(f"[1:a]highpass=f=100,lowpass=f=7000,volume=1.8,acompressor=threshold=-16dB:ratio=6:attack=5:release=80[voice_proc]")
+        
+        # Sidechain: Музыка пригибается под голос
+        filter_complex.append(f"[music_raw][voice_proc]sidechaincompress=threshold=0.05:ratio=10:attack=5:release=300[music_ducked]")
+        
+        # Mix
+        filter_complex.append(f"[music_ducked][voice_proc]amix=inputs=2:duration=first[pre_master]")
+    else:
+        filter_complex.append(f"[music_raw]anull[pre_master]")
+
+    # 📌 Suggestion 5: Loudnorm (Mastering)
+    # EBU R128 стандарт (-14 LUFS для стриминга)
+    filter_complex.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out]")
+
+    cmd += ["-filter_complex", ";".join(filter_complex)]
     cmd += [
-        "-map", "0:v", "-map", "[aout]",
+        "-map", "0:v", "-map", "[out]",
+        "-t", str(total_dur),
         "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-g", "60",
         "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
         "-f", "mpegts", final_video
@@ -251,11 +263,13 @@ def generate_segment(idx, is_dj_turn):
     
     subprocess.run(cmd, check=True)
     
-    for f in [music_path, voice_path, cover_path]:
+    files_to_remove = [music_part1, music_part2, cover_path]
+    if is_dj_turn: files_to_remove.append(voice_path)
+    for f in files_to_remove:
         if f and os.path.exists(f): os.remove(f)
     
     cleanup()
-    print(f"✅ [Worker] Segment {idx} ready ({round(time.time()-t0)}s)")
+    print(f"✅ [Worker] Seg {idx} ready ({round(time.time()-t0)}s)")
     return final_video
 
 def worker_thread():
@@ -270,10 +284,8 @@ def worker_thread():
             seg_path = generate_segment(idx, is_dj_turn)
             video_queue.put(seg_path)
             idx += 1
-            if is_dj_turn:
-                tracks_since_dj = 0
-            else:
-                tracks_since_dj += 1
+            if is_dj_turn: tracks_since_dj = 0
+            else: tracks_since_dj += 1
         except Exception as e:
             print(f"❌ Worker Error: {e}")
             time.sleep(5)
@@ -308,13 +320,12 @@ def streamer_thread():
                     process.stdin.write(chunk)
             process.stdin.flush()
         except BrokenPipeError:
-            print("❌ Stream pipe broken. Restarting FFmpeg...")
+            print("❌ Stream broken. Restarting...")
             process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE)
         except Exception as e:
             print(f"❌ Streamer Error: {e}")
 
-        if os.path.exists(seg_path):
-            os.remove(seg_path)
+        if os.path.exists(seg_path): os.remove(seg_path)
 
 if __name__ == "__main__":
     t_worker = threading.Thread(target=worker_thread, daemon=True)
