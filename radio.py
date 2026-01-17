@@ -157,7 +157,7 @@ def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
     
     cleanup() # Очистка памяти
     
-    # Кондиционирование из примера
+    # Кондиционирование
     conditioning = [{
         "prompt": prompt,
         "seconds_start": 0,
@@ -173,19 +173,25 @@ def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
             sample_size=sample_size,
             sigma_min=0.3,
             sigma_max=500,
-            sampler_type="dpmpp-3m-sde", # Важный параметр для качества!
+            sampler_type="dpmpp-3m-sde",
             device=DEVICE
         )
 
-    # Пост-процессинг из официального примера
-    # Rearrange audio batch to a single sequence
+    # 1. Rearrange audio batch to a single sequence [channels, samples]
     output = rearrange(output, "b d n -> d (b n)")
 
-    # Peak normalize, clip, convert to int16, and save
-    # Используем torch.float32 для вычислений
-    output = output.to(torch.float32).div(torch.max(torch.abs(output))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
+    # 2. Normalize to [-1, 1] (Float32)
+    # Важно: не конвертируем в int16 вручную, soundfile сделает это сам лучше
+    output = output.to(torch.float32).div(torch.max(torch.abs(output))).clamp(-1, 1)
+
+    # 3. Convert to NumPy & Transpose
+    # SoundFile ожидает формат [samples, channels], а не наоборот, поэтому .T
+    audio_np = output.cpu().numpy().T 
     
-    torchaudio.save(out_wav, output, sample_rate)
+    # 4. Save using SoundFile (Это решает ошибку TorchCodec!)
+    # subtype='PCM_16' гарантирует стандартный формат WAV
+    sf.write(out_wav, audio_np, sample_rate, subtype='PCM_16')
+    
     return sample_rate
 
 # =========================
