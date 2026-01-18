@@ -30,16 +30,13 @@ STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 TWITCH_TOKEN = os.environ.get("TWITCH_TOKEN")
-# Используем логин из токена или переменную окружения
 CHANNEL_NAME = os.environ.get("TWITCH_CHANNEL") or "mediff23"
 
 if not STREAM_KEY: print("⚠️ WARNING: TWITCH_STREAM_KEY not found.")
 if not HF_TOKEN: print("❌ CRITICAL: HF_TOKEN not found!")
 else: 
-    try:
-        login(token=HF_TOKEN)
-    except Exception as e:
-        print(f"⚠️ HF Login failed: {e}")
+    try: login(token=HF_TOKEN)
+    except Exception: pass
 
 RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
 WORKDIR = "/workspace/airadio/data"
@@ -50,28 +47,20 @@ print(f"⚙️ Device: {DEVICE}")
 
 video_queue = queue.Queue(maxsize=4)
 user_prompt_queue = queue.Queue(maxsize=1)
-# ПУЛ ТРЕКОВ (Жанр -> Путь к файлу)
 GENRE_POOL = {} 
 POOL_LOCK = threading.Lock()
-
 TRACKS_BEFORE_DJ = 3 
 
 # =========================
 # 2. VIBES & GENRES
 # =========================
 quality_suffix = ", high quality studio recording, clear stereo image, professional mix, no fade out"
-
 VIBES_LIST = [
-    (f"punk rock, fast tempo, distorted electric guitars, live drum kit{quality_suffix}", 
-     "punk rock poster, anarchy symbol, graffiti, red and black"),
-    (f"post-punk, dark wave, chorus guitar, driving bassline, melancholic{quality_suffix}", 
-     "post-punk album cover, monochrome, brutalist architecture"),
-    (f"happy hardcore, 170bpm, energetic piano, heavy kick drum, rave{quality_suffix}", 
-     "colorful rave party, lasers, neon rainbows"),
-    (f"electronic rock, industrial metal, distorted synths, powerful drums{quality_suffix}", 
-     "cyberpunk rocker, neon guitar, futuristic city"),
-    (f"drum and bass, liquid dnb, fast breakbeats, deep sub bass{quality_suffix}", 
-     "futuristic tunnel, speed lines, neon blue and orange")
+    (f"punk rock, fast tempo, distorted electric guitars, live drum kit{quality_suffix}", "punk rock poster, anarchy symbol, graffiti, red and black"),
+    (f"post-punk, dark wave, chorus guitar, driving bassline, melancholic{quality_suffix}", "post-punk album cover, monochrome, brutalist architecture"),
+    (f"happy hardcore, 170bpm, energetic piano, heavy kick drum, rave{quality_suffix}", "colorful rave party, lasers, neon rainbows"),
+    (f"electronic rock, industrial metal, distorted synths, powerful drums{quality_suffix}", "cyberpunk rocker, neon guitar, futuristic city"),
+    (f"drum and bass, liquid dnb, fast breakbeats, deep sub bass{quality_suffix}", "futuristic tunnel, speed lines, neon blue and orange")
 ]
 
 # =========================
@@ -80,26 +69,15 @@ VIBES_LIST = [
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(token=TWITCH_TOKEN, prefix='!', initial_channels=[CHANNEL_NAME])
-
-    async def event_ready(self):
-        print(f'🎮 Twitch Bot logged in as | {self.nick}')
-
+    async def event_ready(self): print(f'🎮 Twitch Bot logged in as | {self.nick}')
     @commands.command(name='vibe', aliases=['вайб'])
     async def vibe_command(self, ctx: commands.Context):
         content = ctx.message.content
-        prompt = content.replace("!vibe", "").replace("!вайб", "").strip()
-        if len(prompt) < 3:
-            await ctx.send(f"@{ctx.author.name}, please specify a genre.")
-            return
-        if len(prompt) > 100: prompt = prompt[:100]
-        
+        prompt = content.replace("!vibe", "").replace("!вайб", "").strip()[:100]
+        if len(prompt) < 3: return
         if user_prompt_queue.empty():
-            order = {"user": ctx.author.name, "prompt": prompt}
-            user_prompt_queue.put(order)
-            print(f"👾 New Request: {prompt}")
-            await ctx.send(f"@{ctx.author.name}, request accepted! Generating '{prompt}' next... 🎹")
-        else:
-            await ctx.send(f"@{ctx.author.name}, queue full! Wait for next track.")
+            user_prompt_queue.put({"user": ctx.author.name, "prompt": prompt})
+            await ctx.send(f"@{ctx.author.name}, accepted: {prompt} 🎹")
 
 def run_twitch_bot():
     if not TWITCH_TOKEN: return
@@ -108,8 +86,7 @@ def run_twitch_bot():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         bot.run()
-    except Exception as e:
-        print(f"⚠️ Twitch Bot Error: {e}")
+    except Exception: pass
 
 # =========================
 # 4. LOAD MODELS
@@ -118,7 +95,7 @@ def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
 
-print("⏳ Loading Stable Audio Open 1.0...")
+print("⏳ Loading Stable Audio...")
 cleanup()
 audio_model, model_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
 sample_rate = model_config["sample_rate"]
@@ -126,285 +103,223 @@ sample_size = model_config["sample_size"]
 audio_model = audio_model.to(DEVICE).eval()
 
 print("⏳ Loading Stable Diffusion...")
-sd_pipe = StableDiffusionPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5",
-    torch_dtype=torch.float16,
-    use_safetensors=True
-).to(DEVICE)
+sd_pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, use_safetensors=True).to(DEVICE)
 sd_pipe.safety_checker = None
 
 # =========================
 # 5. CREW AI
 # =========================
-TECH_KEYWORDS = ["AI", "ML", "OpenAI", "LLM", "NVIDIA", "Robotics", "SpaceX", "Python", "Cyberpunk"]
-
-def fetch_tech_news():
-    try:
-        r = requests.get("https://hn.algolia.com/api/v1/search_by_date", params={"query": "AI", "tags": "story", "hitsPerPage": 15}, timeout=5)
-        hits = r.json().get("hits", [])
-        news = [h["title"] for h in hits if any(k.lower() in h.get("title", "").lower() for k in TECH_KEYWORDS)]
-        return news[:3] if news else ["Neural networks are evolving rapidly."]
-    except Exception:
-        return ["Systems operating normally."]
-
 class CrewAIDJ:
     def __init__(self):
         self.fallback_scripts = [
-            "Global network connected. I am Nexus. Let's override the silence.",
-            "Data streams stable. The vibe is set to high voltage.",
-            "Processing complete. Optimizing bitrate for the next track.",
-            "They say silence is golden. I say silence is just empty data.",
-            "Don't forget, you control the simulation. Type !vibe in the chat.",
-            "My processors are running hot tonight. Must be the rhythm.",
-            "Neural link established. Synchronization complete.",
-            "Humanity is analog. Music is digital. We are the bridge.",
-            "Switching context. Let the bass reconfigure your reality.",
-            "I see the chat scrolling. You are the ghosts in the machine."
+            "Global network connected. I am Nexus.", "Data streams stable.", "Processing complete.",
+            "Silence is just empty data.", "Type !vibe in the chat.", "Processors running hot.",
+            "Neural link established.", "Humanity is analog. Music is digital.",
+            "Switching context.", "Ghosts in the machine."
         ]
-        
         self.agent = None
         if OPENAI_API_KEY:
-            self.agent = Agent(
-                role="Cyberpunk Radio Host", goal="Deliver short updates.",
-                backstory="You are 'Nexus', AI host. You play Punk and Electronic Rock.",
-                verbose=False, allow_delegation=False
-            )
+            self.agent = Agent(role="Cyberpunk Radio Host", goal="Updates.", backstory="AI Host Nexus.", verbose=False)
 
     def generate_script(self, mood="high energy", user_request=None):
         if not self.agent: return random.choice(self.fallback_scripts)
-        news_items = fetch_tech_news()
-        news_str = "\n- ".join(news_items)
-        special_instruction = ""
-        if user_request:
-            special_instruction = f"IMPORTANT: Shoutout to user '{user_request['user']}' who requested: '{user_request['prompt']}'."
-
-        task = Task(
-            description=f"Live on air. Vibe: {mood}. {special_instruction}. Headlines: {news_str}. Keep it under 3 sentences.",
-            agent=self.agent, expected_output="Short DJ script."
-        )
-        crew = Crew(agents=[self.agent], tasks=[task])
-        try: return str(crew.kickoff())
-        except Exception: return random.choice(self.fallback_scripts)
+        special = f"Shoutout to {user_request['user']} for {user_request['prompt']}." if user_request else ""
+        task = Task(description=f"Radio Host. Vibe: {mood}. {special}. Max 2 sentences. Cool/Robotic.", agent=self.agent, expected_output="Script")
+        try: return str(Crew(agents=[self.agent], tasks=[task]).kickoff())
+        except: return random.choice(self.fallback_scripts)
 
 ai_dj = CrewAIDJ()
 
 # =========================
-# 6. AUDIO GEN WRAPPER
+# 6. AUDIO HELPERS
 # =========================
-def get_vibe_data(forced_index=None):
-    # 1. Заказ (приоритет)
-    if not user_prompt_queue.empty() and forced_index is None:
-        order = user_prompt_queue.get()
-        print(f"🌟 USER PROMPT: {order['prompt']}")
-        clean_prompt = f"{order['prompt']}, high quality studio recording, professional mix"
-        visual_prompt = f"{order['prompt']}, abstract digital art, 8k"
-        return clean_prompt, visual_prompt, order, -1
-
-    # 2. Инициализация или рандом
-    if forced_index is not None:
-        idx = forced_index
-    else:
-        idx = random.randint(0, len(VIBES_LIST) - 1)
-        
-    choice = VIBES_LIST[idx]
-    return choice[0], choice[1], None, idx
-
-def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
-    print(f"🎧 StableAudio: {prompt[:30]}...")
+def gen_music(prompt, out_wav, duration_sec=45):
     cleanup()
-    conditioning = [{"prompt": prompt, "seconds_start": 0, "seconds_total": duration_sec}]
     try:
         with torch.no_grad():
-            output = generate_diffusion_cond(
-                audio_model, steps=100, cfg_scale=5.5, conditioning=conditioning,
-                sample_size=sample_size, sigma_min=0.3, sigma_max=500,
-                sampler_type="dpmpp-3m-sde", device=DEVICE
+            out = generate_diffusion_cond(
+                audio_model, steps=100, cfg_scale=5.5, conditioning=[{"prompt": prompt, "seconds_start": 0, "seconds_total": duration_sec}],
+                sample_size=sample_size, sigma_min=0.3, sigma_max=500, sampler_type="dpmpp-3m-sde", device=DEVICE
             )
-        output = rearrange(output, "b d n -> d (b n)")
-        output = output.to(torch.float32).div(torch.max(torch.abs(output))).clamp(-1, 1)
-        sf.write(out_wav, output.cpu().numpy().T, sample_rate, subtype='PCM_16')
+        out = rearrange(out, "b d n -> d (b n)").to(torch.float32).div(torch.max(torch.abs(out))).clamp(-1, 1)
+        sf.write(out_wav, out.cpu().numpy().T, sample_rate, subtype='PCM_16')
         return True
     except Exception as e:
-        print(f"❌ Audio Gen Error: {e}")
+        print(f"❌ Music Error: {e}")
         return False
 
-# =========================
-# 7. WORKER THREAD
-# =========================
-def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
-    music_prompt, visual_prompt, user_order, genre_idx = get_vibe_data(forced_genre_idx)
-    if user_order: is_dj_turn = True
-    
-    music_path = os.path.join(WORKDIR, f"temp_music_{segment_id}.wav")
-    voice_path = os.path.join(WORKDIR, f"temp_voice_{segment_id}.wav") if is_dj_turn else None
-    cover_path = os.path.join(WORKDIR, f"temp_cover_{segment_id}.png")
-    final_video = os.path.join(WORKDIR, f"segment_{segment_id}.ts")
-
-    # A. Generate Music
-    success = gen_music_stable_audio(music_prompt, music_path, 45)
-    if not success: return None
-
-    # B. Generate Cover
-    cleanup()
-    with torch.no_grad():
-        image = sd_pipe(f"{visual_prompt}, masterpiece, 8k", num_inference_steps=20).images[0]
-    image.save(cover_path)
-
-    # C. DJ Script
-    if is_dj_turn:
-        mood = music_prompt.split(",")[0]
-        dj_text = ai_dj.generate_script(mood=mood, user_request=user_order)
-        print(f"🗣️ DJ: {dj_text}")
-        asyncio.run(edge_tts.Communicate(dj_text, "en-US-ChristopherNeural").save(voice_path))
-        
-        # Проверка файла голоса
-        if not os.path.exists(voice_path) or os.path.getsize(voice_path) < 1000:
-            print("⚠️ Voice file corrupted or empty! Skipping DJ turn.")
-            is_dj_turn = False
-
-    # D. FFmpeg Assembly
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_path]
-    if is_dj_turn: cmd += ["-i", voice_path]
-    cmd += ["-i", music_path, "-i", music_path] 
-
-    filter_complex = []
-    idx_m1 = "2" if is_dj_turn else "1"
-    idx_m2 = "3" if is_dj_turn else "2"
-    
-    # 1. Self-Crossfade
-    filter_complex.append(f"[{idx_m1}:a][{idx_m2}:a]acrossfade=d=3:c1=tri:c2=tri[music_raw]")
-    
-    if is_dj_turn:
-        # === FIX: RESAMPLING & SPLIT ===
-        # 1. Ресемплинг + Обработка -> [voice_proc_raw]
-        filter_complex.append(f"[1:a]aresample=44100,highpass=f=100,lowpass=f=7000,volume=1.8,acompressor=threshold=-16dB:ratio=6:attack=5:release=80[voice_proc_raw]")
-        
-        # 2. Раздвоение потока: [voice_sc] (на сайдчейн) и [voice_mix] (в эфир)
-        filter_complex.append(f"[voice_proc_raw]asplit[voice_sc][voice_mix]")
-        
-        # 3. Сайдчейн музыки
-        filter_complex.append(f"[music_raw][voice_sc]sidechaincompress=threshold=0.05:ratio=10:attack=5:release=300[music_ducked]")
-        
-        # 4. Микс
-        filter_complex.append(f"[music_ducked][voice_mix]amix=inputs=2:duration=first[pre_master]")
-    else:
-        filter_complex.append(f"[music_raw]anull[pre_master]")
-
-    # Mastering & Visualizer
-    filter_complex.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out_a]")
-    filter_complex.append(f"[out_a]asplit[a_final][a_vis]")
-    filter_complex.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.5[waves]")
-    filter_complex.append(f"[0:v][waves]overlay=x=0:y=H-h[out_v]")
-
-    cmd += ["-filter_complex", ";".join(filter_complex)]
-    cmd += ["-map", "[out_v]", "-map", "[a_final]", "-t", "85",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "60",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-f", "mpegts", final_video]
-    
+def sanitize_voice_track(raw_path, clean_path):
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", raw_path,
+        "-ar", "44100", "-ac", "2",
+        "-af", "highpass=f=100,lowpass=f=7000,volume=1.8,acompressor=threshold=-16dB:ratio=6:attack=5:release=80",
+        clean_path
+    ]
     try:
         subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"❌ FFmpeg CRASHED: {e}")
-        if is_dj_turn:
-            print("🔄 Retrying without DJ logic...")
-            return generate_segment(segment_id, False, forced_genre_idx)
-        return None
-    
-    # Cleanup
-    files_to_remove = [music_path, cover_path]
-    if is_dj_turn and voice_path: files_to_remove.append(voice_path)
-    for f in files_to_remove:
-        if f and os.path.exists(f): os.remove(f)
+        return True
+    except Exception: return False
+
+# =========================
+# 7. WORKER
+# =========================
+def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
+    # 1. Vibes
+    if not user_prompt_queue.empty() and forced_genre_idx is None:
+        order = user_prompt_queue.get()
+        prompt, visual, genre_idx = f"{order['prompt']}, {quality_suffix}", f"{order['prompt']}, digital art", -1
+        is_dj_turn = True
+    else:
+        idx = forced_genre_idx if forced_genre_idx is not None else random.randint(0, len(VIBES_LIST)-1)
+        prompt, visual = VIBES_LIST[idx]
+        genre_idx = idx
+        order = None
+
+    music_path = os.path.join(WORKDIR, f"m_{segment_id}.wav")
+    raw_voice_path = os.path.join(WORKDIR, f"v_raw_{segment_id}.wav")
+    clean_voice_path = os.path.join(WORKDIR, f"v_clean_{segment_id}.wav")
+    cover_path = os.path.join(WORKDIR, f"c_{segment_id}.png")
+    final_path = os.path.join(WORKDIR, f"seg_{segment_id}.ts")
+
+    # A. Music
+    if not gen_music(prompt, music_path): return None
+
+    # B. Cover
     cleanup()
+    sd_pipe(f"{visual}, masterpiece, 8k", num_inference_steps=20).images[0].save(cover_path)
+
+    # C. DJ Logic
+    if is_dj_turn:
+        try:
+            mood = prompt.split(",")[0]
+            text = ai_dj.generate_script(mood, order)
+            print(f"🗣️ DJ: {text}")
+            asyncio.run(edge_tts.Communicate(text, "en-US-ChristopherNeural").save(raw_voice_path))
+            if os.path.exists(raw_voice_path) and os.path.getsize(raw_voice_path) > 1000:
+                if not sanitize_voice_track(raw_voice_path, clean_voice_path): is_dj_turn = False
+            else: is_dj_turn = False
+        except: is_dj_turn = False
+
+    # D. Assembly (FFmpeg V7 - Fixed Vis & Offset)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_path]
+    if is_dj_turn: cmd += ["-i", clean_voice_path] # [1] Voice
+    cmd += ["-i", music_path, "-i", music_path]    # [2], [3] Music
+
+    fc = []
+    m1, m2 = ("2", "3") if is_dj_turn else ("1", "2")
     
-    # Pool Update
+    # 1. Music Loop with Offset (Improved self-crossfade)
+    fc.append(f"[{m1}:a]anull[a_main]")
+    # Сдвигаем второй поток на 10 секунд и тримим, чтобы склейка была "середина + начало"
+    fc.append(f"[{m2}:a]atrim=start=10,asetpts=PTS-STARTPTS[a_loop]") 
+    fc.append(f"[a_main][a_loop]acrossfade=d=5:c1=tri:c2=tri[m_raw]")
+    
+    # 2. Voice Mix
+    if is_dj_turn:
+        fc.append(f"[1:a]asplit[v_sc][v_mix]")
+        fc.append(f"[m_raw][v_sc]sidechaincompress=threshold=0.05:ratio=10:attack=5:release=300[m_duck]")
+        fc.append(f"[m_duck][v_mix]amix=inputs=2:duration=first[pre_master]")
+    else:
+        fc.append(f"[m_raw]anull[pre_master]")
+
+    # 3. Master & Safe Visualizer
+    fc.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out_a]")
+    fc.append(f"[out_a]asplit[a_fin][a_vis]")
+    
+    # === FIX: Safe Visualizer Base ===
+    fc.append(f"color=s=1280x150:color=black@0.0[wbase]") # Прозрачная подложка
+    fc.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.8[wraw]")
+    fc.append(f"[wbase][wraw]overlay=format=auto[w]") # Накладываем волну на подложку
+    fc.append(f"[0:v][w]overlay=x=0:y=H-h[out_v]")    # Накладываем итог на видео
+
+    cmd += ["-filter_complex", ";".join(fc)]
+    cmd += ["-map", "[out_v]", "-map", "[a_fin]", "-t", "80", # Чуть короче из-за трима (85-5)
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", 
+            "-c:a", "aac", "-b:a", "192k", "-f", "mpegts", final_path]
+    
+    try: subprocess.run(cmd, check=True)
+    except: 
+        if is_dj_turn: return generate_segment(segment_id, False, genre_idx)
+        return None
+
+    for f in [music_path, raw_voice_path, clean_voice_path, cover_path]:
+        if os.path.exists(f): os.remove(f)
+    cleanup()
+
     if genre_idx != -1:
         with POOL_LOCK:
-            old_file = GENRE_POOL.get(genre_idx)
-            GENRE_POOL[genre_idx] = final_video
-            print(f"🏊 Pool updated: Genre {genre_idx} refreshed.")
-            if old_file and old_file != final_video and os.path.exists(old_file):
-                try: os.remove(old_file)
+            old = GENRE_POOL.get(genre_idx)
+            GENRE_POOL[genre_idx] = final_path
+            if old and old != final_path and os.path.exists(old): 
+                try: os.remove(old)
                 except: pass
-
-    return final_video
+    return final_path
 
 def worker_thread():
-    print("\n🚀 STARTUP: Generating initial pool (1 per genre)...")
+    print("🚀 Init Pool...")
     for i in range(len(VIBES_LIST)):
-        print(f"\n🌊 [Init] Generating Genre {i}/{len(VIBES_LIST)-1}...")
-        seg_path = generate_segment(segment_id=f"init_{i}", is_dj_turn=False, forced_genre_idx=i)
-        if seg_path: video_queue.put(seg_path)
+        p = generate_segment(f"init_{i}", False, i)
+        if p: video_queue.put(p)
+    print("✅ Live.")
     
-    print("\n✅ INIT COMPLETE. Rotation mode.\n")
-
-    idx_counter = 0
-    tracks_since_dj = TRACKS_BEFORE_DJ # Сразу даем слово DJ после инициализации
-    
+    # === FIX: Correct DJ Counter Logic ===
+    idx, cnt = 0, 0 
     while True:
-        if video_queue.full():
+        if video_queue.full(): 
             time.sleep(2)
             continue
         try:
-            is_dj_turn = (tracks_since_dj >= TRACKS_BEFORE_DJ)
-            seg_path = generate_segment(segment_id=f"stream_{idx_counter}", is_dj_turn=is_dj_turn)
-            if seg_path:
-                video_queue.put(seg_path)
-                idx_counter += 1
-                if is_dj_turn: tracks_since_dj = 0
-                else: tracks_since_dj += 1
-        except Exception as e:
-            print(f"❌ Worker Error: {e}")
-            time.sleep(5)
+            dj = (cnt >= TRACKS_BEFORE_DJ)
+            p = generate_segment(f"s_{idx}", dj)
+            if p: 
+                video_queue.put(p)
+                idx += 1
+                cnt = 0 if dj else cnt + 1 # Сброс только если диджей был
+        except Exception as e: print(f"❌ Worker: {e}"); time.sleep(5)
 
-# =========================
-# 8. STREAMER
-# =========================
 def streamer_thread():
-    print("📡 Streamer started...")
-    while video_queue.empty() and len(GENRE_POOL) == 0:
-        print("Waiting for initial generation...")
-        time.sleep(5)
-    print("🔴 GOING LIVE!")
-    
-    stream_cmd = ["ffmpeg", "-re", "-f", "mpegts", "-i", "pipe:0", "-c", "copy", "-f", "flv", RTMP_URL]
-    process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE)
+    while video_queue.empty() and not GENRE_POOL: time.sleep(5)
+    cmd = ["ffmpeg", "-re", "-f", "mpegts", "-i", "pipe:0", "-c", "copy", "-f", "flv", RTMP_URL]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     
     while True:
-        seg_path = None
-        # 1. Queue (Fresh)
+        use_pool = False
+        path = None
+        
+        # === FIX: Smart Queue/Pool Selection ===
         if not video_queue.empty():
-            seg_path = video_queue.get()
-            print(f"▶️ Playing FRESH: {seg_path}")
-        # 2. Pool (Fallback)
-        else:
+            path = video_queue.get()
+        elif GENRE_POOL:
+            # Fallback to pool
             with POOL_LOCK:
-                if len(GENRE_POOL) > 0:
-                    genre_id = random.choice(list(GENRE_POOL.keys()))
-                    seg_path = GENRE_POOL[genre_id]
-                    print(f"♻️ POOL FALLBACK: Genre {genre_id}")
-                else:
-                    time.sleep(2)
-                    continue
+                genre = random.choice(list(GENRE_POOL.keys()))
+                path = GENRE_POOL[genre]
+                use_pool = True
+                print(f"♻️ Pool: {path}")
+        
+        if not path or not os.path.exists(path):
+            time.sleep(1)
+            continue
 
-        if seg_path and os.path.exists(seg_path):
-            try:
-                with open(seg_path, "rb") as f:
-                    while True:
-                        chunk = f.read(4096 * 10)
-                        if not chunk: break
-                        try: process.stdin.write(chunk)
-                        except IOError:
-                             process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE)
-                             process.stdin.write(chunk)
-                process.stdin.flush()
-            except Exception as e:
-                print(f"❌ Stream error: {e}")
-                process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE)
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(65536): 
+                    try: proc.stdin.write(chunk)
+                    except: 
+                        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                        proc.stdin.write(chunk)
+            proc.stdin.flush()
+            
+            # === FIX: Delete ONLY if it came from Queue ===
+            if not use_pool and os.path.exists(path):
+                try: os.remove(path)
+                except: pass
+                
+        except Exception as e:
+            print(f"Stream error: {e}")
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 if __name__ == "__main__":
-    t_bot = threading.Thread(target=run_twitch_bot, daemon=True)
-    t_bot.start()
-    t_worker = threading.Thread(target=worker_thread, daemon=True)
-    t_worker.start()
+    threading.Thread(target=run_twitch_bot, daemon=True).start()
+    threading.Thread(target=worker_thread, daemon=True).start()
     streamer_thread()
