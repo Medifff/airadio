@@ -200,7 +200,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
             else: is_dj_turn = False
         except: is_dj_turn = False
 
-    # D. Assembly (FFmpeg V7 - Fixed Vis & Offset)
+    # D. Assembly
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_path]
     if is_dj_turn: cmd += ["-i", clean_voice_path] # [1] Voice
     cmd += ["-i", music_path, "-i", music_path]    # [2], [3] Music
@@ -208,13 +208,12 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     fc = []
     m1, m2 = ("2", "3") if is_dj_turn else ("1", "2")
     
-    # 1. Music Loop with Offset (Improved self-crossfade)
+    # Music Loop
     fc.append(f"[{m1}:a]anull[a_main]")
-    # Сдвигаем второй поток на 10 секунд и тримим, чтобы склейка была "середина + начало"
-    fc.append(f"[{m2}:a]atrim=start=10,asetpts=PTS-STARTPTS[a_loop]") 
+    fc.append(f"[{m2}:a]atrim=start=5,asetpts=PTS-STARTPTS[a_loop]") # Offset for seamless loop
     fc.append(f"[a_main][a_loop]acrossfade=d=5:c1=tri:c2=tri[m_raw]")
     
-    # 2. Voice Mix
+    # Mix Voice
     if is_dj_turn:
         fc.append(f"[1:a]asplit[v_sc][v_mix]")
         fc.append(f"[m_raw][v_sc]sidechaincompress=threshold=0.05:ratio=10:attack=5:release=300[m_duck]")
@@ -222,18 +221,19 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     else:
         fc.append(f"[m_raw]anull[pre_master]")
 
-    # 3. Master & Safe Visualizer
+    # Master & VISUALIZER (FIXED)
     fc.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out_a]")
     fc.append(f"[out_a]asplit[a_fin][a_vis]")
     
-    # === FIX: Safe Visualizer Base ===
-    fc.append(f"color=s=1280x150:color=black@0.0[wbase]") # Прозрачная подложка
+    # Прозрачный фон для волны во избежание крашей оверлея
+    fc.append(f"color=s=1280x150:color=black@0.0[wbase]") 
     fc.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.8[wraw]")
-    fc.append(f"[wbase][wraw]overlay=format=auto[w]") # Накладываем волну на подложку
-    fc.append(f"[0:v][w]overlay=x=0:y=H-h[out_v]")    # Накладываем итог на видео
+    fc.append(f"[wbase][wraw]overlay=format=auto[w]")
+    fc.append(f"[0:v][w]overlay=x=0:y=H-h:format=yuv420p[out_v]") # Force yuv420p
 
     cmd += ["-filter_complex", ";".join(fc)]
-    cmd += ["-map", "[out_v]", "-map", "[a_fin]", "-t", "80", # Чуть короче из-за трима (85-5)
+    # -shortest обрезает видео по длине звука (важно!)
+    cmd += ["-map", "[out_v]", "-map", "[a_fin]", "-shortest",
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", 
             "-c:a", "aac", "-b:a", "192k", "-f", "mpegts", final_path]
     
@@ -250,6 +250,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
         with POOL_LOCK:
             old = GENRE_POOL.get(genre_idx)
             GENRE_POOL[genre_idx] = final_path
+            # Удаляем старый файл только если мы его заменили в пуле
             if old and old != final_path and os.path.exists(old): 
                 try: os.remove(old)
                 except: pass
@@ -262,8 +263,7 @@ def worker_thread():
         if p: video_queue.put(p)
     print("✅ Live.")
     
-    # === FIX: Correct DJ Counter Logic ===
-    idx, cnt = 0, 0 
+    idx, cnt = 0, 0
     while True:
         if video_queue.full(): 
             time.sleep(2)
@@ -274,23 +274,35 @@ def worker_thread():
             if p: 
                 video_queue.put(p)
                 idx += 1
-                cnt = 0 if dj else cnt + 1 # Сброс только если диджей был
+                cnt = 0 if dj else cnt + 1
         except Exception as e: print(f"❌ Worker: {e}"); time.sleep(5)
 
+# =========================
+# 8. STREAMER (FIXED TIMESTAMPS)
+# =========================
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
-    cmd = ["ffmpeg", "-re", "-f", "mpegts", "-i", "pipe:0", "-c", "copy", "-f", "flv", RTMP_URL]
+    
+    # === CRITICAL FIX: Timestamp Flags ===
+    # -use_wallclock_as_timestamps 1: Генерирует новые таймстампы на основе реального времени
+    # -fflags +genpts: Восстанавливает PTS (важно для склейки файлов)
+    cmd = [
+        "ffmpeg", "-re", 
+        "-fflags", "+genpts+igndts", 
+        "-use_wallclock_as_timestamps", "1",
+        "-f", "mpegts", "-i", "pipe:0", 
+        "-c", "copy", 
+        "-f", "flv", RTMP_URL
+    ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     
     while True:
         use_pool = False
         path = None
         
-        # === FIX: Smart Queue/Pool Selection ===
         if not video_queue.empty():
             path = video_queue.get()
         elif GENRE_POOL:
-            # Fallback to pool
             with POOL_LOCK:
                 genre = random.choice(list(GENRE_POOL.keys()))
                 path = GENRE_POOL[genre]
@@ -310,7 +322,7 @@ def streamer_thread():
                         proc.stdin.write(chunk)
             proc.stdin.flush()
             
-            # === FIX: Delete ONLY if it came from Queue ===
+            # Удаляем файл только если он из очереди (а не из пула)
             if not use_pool and os.path.exists(path):
                 try: os.remove(path)
                 except: pass
