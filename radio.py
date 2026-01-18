@@ -149,6 +149,7 @@ def gen_music(prompt, out_wav, duration_sec=45):
         return False
 
 def sanitize_voice_track(raw_path, clean_path):
+    # Приводим голос к 44100Hz чтобы не ломать FFmpeg
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", raw_path,
         "-ar", "44100", "-ac", "2",
@@ -196,24 +197,25 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
             print(f"🗣️ DJ: {text}")
             asyncio.run(edge_tts.Communicate(text, "en-US-ChristopherNeural").save(raw_voice_path))
             if os.path.exists(raw_voice_path) and os.path.getsize(raw_voice_path) > 1000:
+                # Очистка и конвертация голоса
                 if not sanitize_voice_track(raw_voice_path, clean_voice_path): is_dj_turn = False
             else: is_dj_turn = False
         except: is_dj_turn = False
 
     # D. Assembly
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_path]
-    if is_dj_turn: cmd += ["-i", clean_voice_path] # [1] Voice
+    if is_dj_turn: cmd += ["-i", clean_voice_path] # [1] Clean Voice
     cmd += ["-i", music_path, "-i", music_path]    # [2], [3] Music
 
     fc = []
     m1, m2 = ("2", "3") if is_dj_turn else ("1", "2")
     
-    # Music Loop
+    # 1. Music Loop with Offset
     fc.append(f"[{m1}:a]anull[a_main]")
-    fc.append(f"[{m2}:a]atrim=start=5,asetpts=PTS-STARTPTS[a_loop]") # Offset for seamless loop
+    fc.append(f"[{m2}:a]atrim=start=5,asetpts=PTS-STARTPTS[a_loop]")
     fc.append(f"[a_main][a_loop]acrossfade=d=5:c1=tri:c2=tri[m_raw]")
     
-    # Mix Voice
+    # 2. Voice Mix
     if is_dj_turn:
         fc.append(f"[1:a]asplit[v_sc][v_mix]")
         fc.append(f"[m_raw][v_sc]sidechaincompress=threshold=0.05:ratio=10:attack=5:release=300[m_duck]")
@@ -221,18 +223,17 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     else:
         fc.append(f"[m_raw]anull[pre_master]")
 
-    # Master & VISUALIZER (FIXED)
+    # 3. Master & Visualizer (ИСПРАВЛЕНА ОШИБКА overlay)
     fc.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out_a]")
     fc.append(f"[out_a]asplit[a_fin][a_vis]")
     
-    # Прозрачный фон для волны во избежание крашей оверлея
     fc.append(f"color=s=1280x150:color=black@0.0[wbase]") 
     fc.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.8[wraw]")
     fc.append(f"[wbase][wraw]overlay=format=auto[w]")
-    fc.append(f"[0:v][w]overlay=x=0:y=H-h:format=yuv420p[out_v]") # Force yuv420p
+    # УБРАЛИ :format=yuv420p из самого фильтра overlay, так как это крашило FFmpeg
+    fc.append(f"[0:v][w]overlay=x=0:y=H-h[out_v]") 
 
     cmd += ["-filter_complex", ";".join(fc)]
-    # -shortest обрезает видео по длине звука (важно!)
     cmd += ["-map", "[out_v]", "-map", "[a_fin]", "-shortest",
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", 
             "-c:a", "aac", "-b:a", "192k", "-f", "mpegts", final_path]
@@ -250,7 +251,6 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
         with POOL_LOCK:
             old = GENRE_POOL.get(genre_idx)
             GENRE_POOL[genre_idx] = final_path
-            # Удаляем старый файл только если мы его заменили в пуле
             if old and old != final_path and os.path.exists(old): 
                 try: os.remove(old)
                 except: pass
@@ -277,15 +277,10 @@ def worker_thread():
                 cnt = 0 if dj else cnt + 1
         except Exception as e: print(f"❌ Worker: {e}"); time.sleep(5)
 
-# =========================
-# 8. STREAMER (FIXED TIMESTAMPS)
-# =========================
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # === CRITICAL FIX: Timestamp Flags ===
-    # -use_wallclock_as_timestamps 1: Генерирует новые таймстампы на основе реального времени
-    # -fflags +genpts: Восстанавливает PTS (важно для склейки файлов)
+    # Флаги для предотвращения зависаний плеера Twitch
     cmd = [
         "ffmpeg", "-re", 
         "-fflags", "+genpts+igndts", 
@@ -322,7 +317,6 @@ def streamer_thread():
                         proc.stdin.write(chunk)
             proc.stdin.flush()
             
-            # Удаляем файл только если он из очереди (а не из пула)
             if not use_pool and os.path.exists(path):
                 try: os.remove(path)
                 except: pass
