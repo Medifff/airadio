@@ -16,7 +16,7 @@ from diffusers import StableDiffusionPipeline
 import edge_tts
 from crewai import Agent, Task, Crew
 from huggingface_hub import login
-
+import sys
 # === OFFICIAL IMPORTS ===
 from stable_audio_tools import get_pretrained_model
 from stable_audio_tools.inference.generation import generate_diffusion_cond
@@ -264,8 +264,11 @@ def generate_segment(idx, is_dj_turn):
 
     # 📌 Suggestion 5: Loudnorm (Mastering)
     # EBU R128 стандарт (-14 LUFS для стриминга)
-    filter_complex.append("[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out]")
-
+    filter_complex.append(
+        "[pre_master]aresample=44100:async=1:first_pts=0,"  # <--- ВОТ ЭТО
+        "loudnorm=I=-14:TP=-1.0:LRA=11[out]"
+    )
+    
     cmd += ["-filter_complex", ";".join(filter_complex)]
     cmd += [
         "-map", "0:v", "-map", "[out]",
@@ -319,11 +322,10 @@ def streamer_thread():
         time.sleep(5)
     print("🔴 GOING LIVE!")
 
-    # ⚠️ ВАЖНО: Добавлены флаги стабильности genpts и wallclock
     stream_cmd = [
-        "ffmpeg", "-re",
-        "-fflags", "+genpts",                  # FIX: Генерировать новые метки времени
-        "-use_wallclock_as_timestamps", "1",   # FIX: Использовать системное время
+        "ffmpeg",
+        "-fflags", "+genpts",
+        "-use_wallclock_as_timestamps", "1",
         "-f", "mpegts", "-i", "pipe:0",
         "-c", "copy",
         "-f", "flv", RTMP_URL
@@ -345,7 +347,12 @@ def streamer_thread():
             process.stdin.flush()
         except BrokenPipeError:
             print("❌ Stream broken. Restarting...")
-            process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE)
+            process = subprocess.Popen(
+                stream_cmd, 
+                stdin=subprocess.PIPE, 
+                stdout=sys.stdout,  # Видеть логи FFmpeg в консоли
+                stderr=sys.stderr   # Видеть ошибки FFmpeg в консоли
+            )
         except Exception as e:
             print(f"❌ Streamer Error: {e}")
 
