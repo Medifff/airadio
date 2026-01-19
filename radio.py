@@ -48,6 +48,7 @@ print(f"⚙️ Device: {DEVICE}", flush=True)
 video_queue = queue.Queue(maxsize=4)
 user_prompt_queue = queue.Queue(maxsize=1)
 GENRE_POOL = {} 
+GENRE_IMAGES = {} # Кэш картинок
 POOL_LOCK = threading.Lock()
 TRACKS_BEFORE_DJ = 3 
 
@@ -55,6 +56,7 @@ TRACKS_BEFORE_DJ = 3
 # 2. VIBES
 # =========================
 quality_suffix = ", high quality studio recording, clear stereo image, professional mix, no fade out"
+# (Prompt, Visual Prompt)
 VIBES_LIST = [
     (f"punk rock, fast tempo, distorted electric guitars, live drum kit{quality_suffix}", "punk rock poster, anarchy symbol, graffiti, red and black"),
     (f"post-punk, dark wave, chorus guitar, driving bassline, melancholic{quality_suffix}", "post-punk album cover, monochrome, brutalist architecture"),
@@ -89,25 +91,49 @@ def run_twitch_bot():
     except Exception: pass
 
 # =========================
-# 4. LOAD MODELS (HYBRID STRATEGY)
+# 4. LOAD MODELS
 # =========================
 def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
 
-# 1. Stable Audio: Держим на CPU, грузим на GPU только для работы
+# --- PRE-GENERATE IMAGES ---
+def init_images():
+    print("🎨 Generating Genre Covers (One-time)...", flush=True)
+    cleanup()
+    
+    # Грузим SD только на время генерации обложек
+    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, use_safetensors=True).to(DEVICE)
+    pipe.safety_checker = None
+
+    # Генерируем 5 обложек для жанров
+    for i, (audio_prompt, visual_prompt) in enumerate(VIBES_LIST):
+        path = os.path.join(WORKDIR, f"cover_genre_{i}.png")
+        if not os.path.exists(path):
+            print(f"   - Cover {i}: {visual_prompt[:20]}...", flush=True)
+            pipe(f"{visual_prompt}, masterpiece, 8k, wallpaper", num_inference_steps=25).images[0].save(path)
+        GENRE_IMAGES[i] = path
+
+    # Генерируем 1 обложку для "User Request"
+    req_path = os.path.join(WORKDIR, "cover_request.png")
+    if not os.path.exists(req_path):
+        pipe("Abstract AI art, digital soundwaves, neon cyber, masterpiece", num_inference_steps=25).images[0].save(req_path)
+    GENRE_IMAGES["request"] = req_path
+
+    # УДАЛЯЕМ SD ИЗ ПАМЯТИ НАВСЕГДА
+    del pipe
+    cleanup()
+    print("🎨 Covers ready. SD unloaded. VRAM freed.", flush=True)
+
+# Запускаем генерацию картинок сразу
+init_images()
+
 print("⏳ Loading Stable Audio (CPU)...", flush=True)
-cleanup()
 audio_model, model_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
 sample_rate = model_config["sample_rate"]
 sample_size = model_config["sample_size"]
+# Модель живет на CPU, прыгает на GPU только для работы
 audio_model = audio_model.to("cpu").eval() 
-
-# 2. Stable Diffusion: Держим на GPU постоянно (A4000 позволяет)
-print("⏳ Loading Stable Diffusion (GPU)...", flush=True)
-sd_pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, use_safetensors=True)
-sd_pipe = sd_pipe.to(DEVICE) # Сразу на GPU
-sd_pipe.safety_checker = None
 
 # =========================
 # 5. CREW AI
@@ -140,17 +166,16 @@ def gen_music(prompt, out_wav, duration_sec=45):
     print(f"🎧 StableAudio Generating...", flush=True)
     cleanup()
     try:
-        # A. Audio Model -> GPU (Swap In)
+        # Swap In
         audio_model.to(DEVICE)
         
-        # B. Generate
         with torch.no_grad():
             out = generate_diffusion_cond(
                 audio_model, steps=100, cfg_scale=5.5, conditioning=[{"prompt": prompt, "seconds_start": 0, "seconds_total": duration_sec}],
                 sample_size=sample_size, sigma_min=0.3, sigma_max=500, sampler_type="dpmpp-3m-sde", device=DEVICE
             )
         
-        # C. Audio Model -> CPU (Swap Out)
+        # Swap Out (сразу освобождаем GPU)
         audio_model.to("cpu")
         cleanup()
 
@@ -171,43 +196,36 @@ def sanitize_voice_track(raw_path, clean_path):
         "-af", "highpass=f=100,lowpass=f=7000,volume=1.8,acompressor=threshold=-16dB:ratio=6:attack=5:release=80",
         clean_path
     ]
-    try:
-        subprocess.run(cmd, check=True)
-        return True
-    except Exception: return False
+    try: subprocess.run(cmd, check=True); return True
+    except: return False
 
 # =========================
 # 7. WORKER
 # =========================
 def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
-    # 1. Vibes
+    # 1. Vibes & Image Selection
     if not user_prompt_queue.empty() and forced_genre_idx is None:
         order = user_prompt_queue.get()
-        prompt, visual, genre_idx = f"{order['prompt']}, {quality_suffix}", f"{order['prompt']}, digital art", -1
+        prompt, genre_idx = f"{order['prompt']}, {quality_suffix}", -1
+        cover_file = GENRE_IMAGES["request"] # Используем готовую картинку для реквестов
         is_dj_turn = True
     else:
         idx = forced_genre_idx if forced_genre_idx is not None else random.randint(0, len(VIBES_LIST)-1)
-        prompt, visual = VIBES_LIST[idx]
+        prompt, _ = VIBES_LIST[idx]
         genre_idx = idx
+        cover_file = GENRE_IMAGES[idx] # Используем кэшированную картинку
         order = None
 
     music_path = os.path.join(WORKDIR, f"m_{segment_id}.wav")
     raw_voice_path = os.path.join(WORKDIR, f"v_raw_{segment_id}.wav")
     clean_voice_path = os.path.join(WORKDIR, f"v_clean_{segment_id}.wav")
-    cover_path = os.path.join(WORKDIR, f"c_{segment_id}.png")
     final_path = os.path.join(WORKDIR, f"seg_{segment_id}.ts")
 
     # A. Music
     if not gen_music(prompt, music_path): return None
 
-    # B. Cover (SD is already on GPU, very fast)
-    try:
-        sd_pipe(f"{visual}, masterpiece, 8k", num_inference_steps=20).images[0].save(cover_path)
-    except Exception as e:
-        print(f"⚠️ SD Error: {e}")
-        # Создаем черный квадрат если SD упала
-        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=512x512", "-frames:v", "1", cover_path], check=False)
-
+    # B. Cover (SKIPPED - Already generated)
+    
     # C. DJ Logic
     if is_dj_turn:
         try:
@@ -220,43 +238,36 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
             else: is_dj_turn = False
         except: is_dj_turn = False
 
-    # D. Assembly
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_path]
+    # D. Assembly (LITE MODE - No Visualizer)
+    # -tune stillimage оптимизирует кодирование статичной картинки (почти 0 CPU)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_file]
     if is_dj_turn: cmd += ["-i", clean_voice_path] # [1]
     cmd += ["-i", music_path, "-i", music_path]    # [2], [3]
 
     fc = []
     m1, m2 = ("2", "3") if is_dj_turn else ("1", "2")
     
-    # 1. Music Loop with Offset
+    # 1. Music Loop (Simple)
     fc.append(f"[{m1}:a]anull[a_main]")
     fc.append(f"[{m2}:a]atrim=start=5,asetpts=PTS-STARTPTS[a_loop]")
     fc.append(f"[a_main][a_loop]acrossfade=d=5:c1=tri:c2=tri[m_raw]")
     
-    # 2. Voice Mix
+    # 2. Voice Mix (Simple Audio Only)
     if is_dj_turn:
         fc.append(f"[1:a]asplit[v_sc][v_mix]")
         fc.append(f"[m_raw][v_sc]sidechaincompress=threshold=0.05:ratio=10:attack=5:release=300[m_duck]")
-        fc.append(f"[m_duck][v_mix]amix=inputs=2:duration=first[pre_master]")
+        fc.append(f"[m_duck][v_mix]amix=inputs=2:duration=first[a_fin]")
     else:
-        fc.append(f"[m_raw]anull[pre_master]")
-
-    # 3. Master & Vis (ROBUST RGBA)
-    fc.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out_a]")
-    fc.append(f"[out_a]asplit[a_fin][a_vis]")
-    
-    fc.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.8,format=rgba[waves]") # Explicit RGBA
-    fc.append(f"[0:v]format=rgba[base]") # Convert cover to RGBA
-    fc.append(f"[base][waves]overlay=x=0:y=H-h:format=auto[out_v]") 
+        fc.append(f"[m_raw]loudnorm=I=-14:TP=-1.0:LRA=11[a_fin]")
 
     cmd += ["-filter_complex", ";".join(fc)]
     
-    # === CRITICAL: FIXED TIMING & FRAMERATE ===
+    # Video settings optimized for static image
     cmd += [
-        "-map", "[out_v]", "-map", "[a_fin]", 
+        "-map", "0:v", "-map", "[a_fin]", 
         "-t", "80", 
-        "-c:v", "libx264", "-preset", "ultrafast", 
-        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", # 30 FPS, GOP 60 (2 sec)
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", # <-- Super Fast Video
+        "-pix_fmt", "yuv420p", "-r", "10", "-g", "20", # 10 FPS достаточно для статики
         "-c:a", "aac", "-b:a", "192k", 
         "-f", "mpegts", final_path
     ]
@@ -267,7 +278,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
         if is_dj_turn: return generate_segment(segment_id, False, genre_idx)
         return None
 
-    for f in [music_path, raw_voice_path, clean_voice_path, cover_path]:
+    for f in [music_path, raw_voice_path, clean_voice_path]: # Не удаляем cover_file!
         if os.path.exists(f): os.remove(f)
     cleanup()
 
@@ -275,13 +286,14 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
         with POOL_LOCK:
             old = GENRE_POOL.get(genre_idx)
             GENRE_POOL[genre_idx] = final_path
+            # Старые видео файлы удаляем
             if old and old != final_path and os.path.exists(old): 
                 try: os.remove(old)
                 except: pass
     return final_path
 
 def worker_thread():
-    print("🚀 Init Pool...", flush=True)
+    print("🚀 Init Pool (Generating audio only)...", flush=True)
     for i in range(len(VIBES_LIST)):
         print(f"🌊 Gen {i}...", flush=True)
         p = generate_segment(f"init_{i}", False, i)
@@ -305,7 +317,6 @@ def worker_thread():
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # Twitch-friendly flags
     cmd = [
         "ffmpeg", "-re", 
         "-fflags", "+genpts+igndts", 
