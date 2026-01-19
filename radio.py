@@ -318,55 +318,60 @@ def worker_thread():
 # =========================
 def streamer_thread():
     print("📡 Streamer started. Buffering...")
-    while video_queue.qsize() < 1:
+    # Ждем, пока будет хотя бы 2 сегмента, чтобы был запас
+    while video_queue.qsize() < 2:
+        print(f"⏳ Buffering... ({video_queue.qsize()}/2)")
         time.sleep(5)
-    print("🔴 GOING LIVE!")
+    print("🔴 GOING LIVE! (NVENC Activated)")
 
-    # 1. Мы убрали -c copy (это корень зла)
-    # 2. Добавили перекодировку видео (libx264, очень быстро) и аудио
-    # 3. Фильтр aresample выравнивает любые сбои аудио
     stream_cmd = [
         "ffmpeg",
-        "-re",                          # Читать вход с нормальной скоростью
-        "-fflags", "+genpts+discardcorrupt", # Игнорировать битые метки на входе
+        "-re",                          # Читать вход в реальном времени (важно для pipe)
+        "-fflags", "+genpts+discardcorrupt", # Лечим входные баги
         "-i", "pipe:0",                 # Читаем из Python
         
-        # --- ВИДЕО ---
-        "-c:v", "libx264",              # Кодируем заново (создает новые PTS)
-        "-preset", "ultrafast",         # Минимальная нагрузка на CPU
-        "-tune", "zerolatency",         # Для стриминга
-        "-r", "30",                     # Жестко задаем 30 FPS
-        "-g", "60",                     # Keyframe каждые 2 сек (требование Twitch)
-        "-b:v", "3000k",                # Битрейт 3000kbps
+        # --- ВИДЕО (NVENC - Hardware) ---
+        "-c:v", "h264_nvenc",           # Используем GPU NVIDIA!
+        "-preset", "p1",                # p1 = самый быстрый пресет NVENC
+        "-tune", "ll",                  # Low Latency
+        "-r", "30",                     # Жесткие 30 FPS
+        "-g", "60",                     # Keyframe каждые 2 сек
+        "-b:v", "2500k",                # Битрейт чуть ниже для стабильности
         "-pix_fmt", "yuv420p",
         
+        # Лечение времени видео: создаем новые PTS, начиная с 0
+        "-vf", "setpts=N/FPS/TB", 
+
         # --- АУДИО ---
         "-c:a", "aac",
-        "-b:a", "160k",
+        "-b:a", "128k",                 # 128k достаточно для стрима
         "-ar", "44100",
-        "-af", "aresample=async=1000",  # МАГИЯ: Лечит рассинхрон и щелчки
+        # Лечение времени аудио: выравнивание и заполнение дыр
+        "-af", "aresample=async=1000",
         
         "-f", "flv", RTMP_URL
     ]
 
-    # Важно: stderr=sys.stderr чтобы видеть ошибки, если они будут
     process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE, stderr=sys.stderr)
 
     while True:
+        # Если очередь пуста, мы в беде. Но с ускоренным воркером этого быть не должно.
+        if video_queue.empty():
+            print("⚠️ BUFFER UNDERRUN! Waiting for worker...")
+        
         seg_path = video_queue.get()
-        print(f"▶️ Playing: {seg_path}")
+        print(f"▶️ Feeding: {seg_path} | Queue: {video_queue.qsize()}")
 
         try:
             with open(seg_path, "rb") as f:
                 while True:
-                    chunk = f.read(4096 * 10) # Читаем большими кусками
+                    chunk = f.read(65536) # Читаем кусками по 64кб
                     if not chunk:
                         break
                     process.stdin.write(chunk)
             process.stdin.flush()
         except BrokenPipeError:
-            print("❌ Stream broken. Restarting...")
-            # Тут можно добавить логику перезапуска, но с новым кодом падать не должно
+            print("❌ Stream broken (BrokenPipe). Restarting connection...")
             process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE, stderr=sys.stderr)
         except Exception as e:
             print(f"❌ Streamer Error: {e}")
