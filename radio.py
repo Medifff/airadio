@@ -283,24 +283,25 @@ def worker_thread():
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # === STREAMER FIX V15: TWITCH BROADCAST STANDARDS ===
+    # === STREAMER FIX V16.1: PERFECT SYNC + NVENC ===
+    # 1. Removed -re (No throttling)
+    # 2. NVENC CBR (Hardware Encoding)
+    # 3. aresample=async=0 (No stretching)
     cmd = [
-        "ffmpeg", "-re",
-        "-fflags", "+genpts",
+        "ffmpeg",
+        "-fflags", "+genpts+igndts",
         "-use_wallclock_as_timestamps", "1",
         
         "-f", "mpegts", "-i", "pipe:0",
         
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        # NVENC: Hardware Acceleration on RTX A4000
+        "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "cbr",
         "-b:v", "3000k", "-minrate", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
+        "-r", "30", "-g", "60",
         
-        # GOP and Keyframe Enforcement for Twitch
-        "-g", "60", "-keyint_min", "60", "-sc_threshold", "0", "-r", "30",
-        
-        "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
-        
+        # AUDIO: No stretching, just clean pass-through or linear resample
         "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-        "-af", "aresample=async=1:first_pts=0",
+        "-af", "aresample=async=0:first_pts=0",
         
         "-f", "flv", RTMP_URL
     ]
@@ -319,9 +320,7 @@ def streamer_thread():
         
         if not path or not os.path.exists(path): time.sleep(1); continue
 
-        # ЗАЩИТА ОТ БИТЫХ ФАЙЛОВ
         if os.path.getsize(path) < 100 * 1024:
-             print(f"⚠️ Skipping broken segment (too small): {path}", flush=True)
              try: os.remove(path)
              except: pass
              continue
