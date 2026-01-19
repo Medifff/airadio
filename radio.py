@@ -30,11 +30,10 @@ STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 TWITCH_TOKEN = os.environ.get("TWITCH_TOKEN")
-# Используем имя канала из переменной или дефолтное
 CHANNEL_NAME = os.environ.get("TWITCH_CHANNEL") or "mediff23"
 
-if not STREAM_KEY: print("⚠️ WARNING: TWITCH_STREAM_KEY not found.")
-if not HF_TOKEN: print("❌ CRITICAL: HF_TOKEN not found!")
+if not STREAM_KEY: print("⚠️ WARNING: TWITCH_STREAM_KEY not found.", flush=True)
+if not HF_TOKEN: print("❌ CRITICAL: HF_TOKEN not found!", flush=True)
 else: 
     try: login(token=HF_TOKEN)
     except Exception: pass
@@ -44,7 +43,7 @@ WORKDIR = "/workspace/airadio/data"
 os.makedirs(WORKDIR, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"⚙️ Device: {DEVICE}")
+print(f"⚙️ Device: {DEVICE}", flush=True)
 
 video_queue = queue.Queue(maxsize=4)
 user_prompt_queue = queue.Queue(maxsize=1)
@@ -53,7 +52,7 @@ POOL_LOCK = threading.Lock()
 TRACKS_BEFORE_DJ = 3 
 
 # =========================
-# 2. VIBES & GENRES
+# 2. VIBES
 # =========================
 quality_suffix = ", high quality studio recording, clear stereo image, professional mix, no fade out"
 VIBES_LIST = [
@@ -70,7 +69,7 @@ VIBES_LIST = [
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(token=TWITCH_TOKEN, prefix='!', initial_channels=[CHANNEL_NAME])
-    async def event_ready(self): print(f'🎮 Twitch Bot logged in as | {self.nick}')
+    async def event_ready(self): print(f'🎮 Twitch Bot logged in as | {self.nick}', flush=True)
     @commands.command(name='vibe', aliases=['вайб'])
     async def vibe_command(self, ctx: commands.Context):
         content = ctx.message.content
@@ -90,21 +89,24 @@ def run_twitch_bot():
     except Exception: pass
 
 # =========================
-# 4. LOAD MODELS
+# 4. LOAD MODELS (HYBRID STRATEGY)
 # =========================
 def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
 
-print("⏳ Loading Stable Audio...")
+# 1. Stable Audio: Держим на CPU, грузим на GPU только для работы
+print("⏳ Loading Stable Audio (CPU)...", flush=True)
 cleanup()
 audio_model, model_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
 sample_rate = model_config["sample_rate"]
 sample_size = model_config["sample_size"]
-audio_model = audio_model.to(DEVICE).eval()
+audio_model = audio_model.to("cpu").eval() 
 
-print("⏳ Loading Stable Diffusion...")
-sd_pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, use_safetensors=True).to(DEVICE)
+# 2. Stable Diffusion: Держим на GPU постоянно (A4000 позволяет)
+print("⏳ Loading Stable Diffusion (GPU)...", flush=True)
+sd_pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, use_safetensors=True)
+sd_pipe = sd_pipe.to(DEVICE) # Сразу на GPU
 sd_pipe.safety_checker = None
 
 # =========================
@@ -135,18 +137,31 @@ ai_dj = CrewAIDJ()
 # 6. AUDIO HELPERS
 # =========================
 def gen_music(prompt, out_wav, duration_sec=45):
+    print(f"🎧 StableAudio Generating...", flush=True)
     cleanup()
     try:
+        # A. Audio Model -> GPU (Swap In)
+        audio_model.to(DEVICE)
+        
+        # B. Generate
         with torch.no_grad():
             out = generate_diffusion_cond(
                 audio_model, steps=100, cfg_scale=5.5, conditioning=[{"prompt": prompt, "seconds_start": 0, "seconds_total": duration_sec}],
                 sample_size=sample_size, sigma_min=0.3, sigma_max=500, sampler_type="dpmpp-3m-sde", device=DEVICE
             )
+        
+        # C. Audio Model -> CPU (Swap Out)
+        audio_model.to("cpu")
+        cleanup()
+
         out = rearrange(out, "b d n -> d (b n)").to(torch.float32).div(torch.max(torch.abs(out))).clamp(-1, 1)
         sf.write(out_wav, out.cpu().numpy().T, sample_rate, subtype='PCM_16')
         return True
     except Exception as e:
-        print(f"❌ Music Error: {e}")
+        print(f"❌ Music Error: {e}", flush=True)
+        try: audio_model.to("cpu")
+        except: pass
+        cleanup()
         return False
 
 def sanitize_voice_track(raw_path, clean_path):
@@ -185,16 +200,20 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     # A. Music
     if not gen_music(prompt, music_path): return None
 
-    # B. Cover
-    cleanup()
-    sd_pipe(f"{visual}, masterpiece, 8k", num_inference_steps=20).images[0].save(cover_path)
+    # B. Cover (SD is already on GPU, very fast)
+    try:
+        sd_pipe(f"{visual}, masterpiece, 8k", num_inference_steps=20).images[0].save(cover_path)
+    except Exception as e:
+        print(f"⚠️ SD Error: {e}")
+        # Создаем черный квадрат если SD упала
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=512x512", "-frames:v", "1", cover_path], check=False)
 
     # C. DJ Logic
     if is_dj_turn:
         try:
             mood = prompt.split(",")[0]
             text = ai_dj.generate_script(mood, order)
-            print(f"🗣️ DJ: {text}")
+            print(f"🗣️ DJ: {text}", flush=True)
             asyncio.run(edge_tts.Communicate(text, "en-US-ChristopherNeural").save(raw_voice_path))
             if os.path.exists(raw_voice_path) and os.path.getsize(raw_voice_path) > 1000:
                 if not sanitize_voice_track(raw_voice_path, clean_voice_path): is_dj_turn = False
@@ -203,8 +222,8 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
 
     # D. Assembly
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_path]
-    if is_dj_turn: cmd += ["-i", clean_voice_path] # [1] Clean Voice
-    cmd += ["-i", music_path, "-i", music_path]    # [2], [3] Music
+    if is_dj_turn: cmd += ["-i", clean_voice_path] # [1]
+    cmd += ["-i", music_path, "-i", music_path]    # [2], [3]
 
     fc = []
     m1, m2 = ("2", "3") if is_dj_turn else ("1", "2")
@@ -222,26 +241,29 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     else:
         fc.append(f"[m_raw]anull[pre_master]")
 
-    # 3. Master & Visualizer (ИСПРАВЛЕНО: убрал :format=yuv420p из оверлея)
+    # 3. Master & Vis (ROBUST RGBA)
     fc.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out_a]")
     fc.append(f"[out_a]asplit[a_fin][a_vis]")
     
-    fc.append(f"color=s=1280x150:color=black@0.0[wbase]") 
-    fc.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.8[wraw]")
-    fc.append(f"[wbase][wraw]overlay=format=auto[w]")
-    
-    # ВОТ ЗДЕСЬ БЫЛА ОШИБКА. Убираем :format=yuv420p из строки фильтра
-    fc.append(f"[0:v][w]overlay=x=0:y=H-h[out_v]") 
+    fc.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.8,format=rgba[waves]") # Explicit RGBA
+    fc.append(f"[0:v]format=rgba[base]") # Convert cover to RGBA
+    fc.append(f"[base][waves]overlay=x=0:y=H-h:format=auto[out_v]") 
 
     cmd += ["-filter_complex", ";".join(fc)]
     
-    # Параметр пикселей передается здесь, в основных флагах
-    cmd += ["-map", "[out_v]", "-map", "[a_fin]", "-shortest",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", 
-            "-c:a", "aac", "-b:a", "192k", "-f", "mpegts", final_path]
+    # === CRITICAL: FIXED TIMING & FRAMERATE ===
+    cmd += [
+        "-map", "[out_v]", "-map", "[a_fin]", 
+        "-t", "80", 
+        "-c:v", "libx264", "-preset", "ultrafast", 
+        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", # 30 FPS, GOP 60 (2 sec)
+        "-c:a", "aac", "-b:a", "192k", 
+        "-f", "mpegts", final_path
+    ]
     
     try: subprocess.run(cmd, check=True)
-    except: 
+    except Exception as e: 
+        print(f"❌ FFmpeg Error: {e}", flush=True)
         if is_dj_turn: return generate_segment(segment_id, False, genre_idx)
         return None
 
@@ -259,12 +281,12 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     return final_path
 
 def worker_thread():
-    print("🚀 Init Pool...")
+    print("🚀 Init Pool...", flush=True)
     for i in range(len(VIBES_LIST)):
-        print(f"🌊 Gen {i}...")
+        print(f"🌊 Gen {i}...", flush=True)
         p = generate_segment(f"init_{i}", False, i)
         if p: video_queue.put(p)
-    print("✅ Live.")
+    print("✅ Live.", flush=True)
     
     idx, cnt = 0, 0
     while True:
@@ -278,12 +300,12 @@ def worker_thread():
                 video_queue.put(p)
                 idx += 1
                 cnt = 0 if dj else cnt + 1
-        except Exception as e: print(f"❌ Worker: {e}"); time.sleep(5)
+        except Exception as e: print(f"❌ Worker: {e}", flush=True); time.sleep(5)
 
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # Флаги для стабильности плеера
+    # Twitch-friendly flags
     cmd = [
         "ffmpeg", "-re", 
         "-fflags", "+genpts+igndts", 
@@ -305,7 +327,7 @@ def streamer_thread():
                 genre = random.choice(list(GENRE_POOL.keys()))
                 path = GENRE_POOL[genre]
                 use_pool = True
-                print(f"♻️ Pool: {path}")
+                print(f"♻️ Pool: {path}", flush=True)
         
         if not path or not os.path.exists(path):
             time.sleep(1)
@@ -325,7 +347,7 @@ def streamer_thread():
                 except: pass
                 
         except Exception as e:
-            print(f"Stream error: {e}")
+            print(f"Stream error: {e}", flush=True)
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 if __name__ == "__main__":
