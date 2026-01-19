@@ -30,6 +30,7 @@ STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 TWITCH_TOKEN = os.environ.get("TWITCH_TOKEN")
+# Используем имя канала из переменной или дефолтное
 CHANNEL_NAME = os.environ.get("TWITCH_CHANNEL") or "mediff23"
 
 if not STREAM_KEY: print("⚠️ WARNING: TWITCH_STREAM_KEY not found.")
@@ -149,7 +150,6 @@ def gen_music(prompt, out_wav, duration_sec=45):
         return False
 
 def sanitize_voice_track(raw_path, clean_path):
-    # Приводим голос к 44100Hz чтобы не ломать FFmpeg
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", raw_path,
         "-ar", "44100", "-ac", "2",
@@ -197,7 +197,6 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
             print(f"🗣️ DJ: {text}")
             asyncio.run(edge_tts.Communicate(text, "en-US-ChristopherNeural").save(raw_voice_path))
             if os.path.exists(raw_voice_path) and os.path.getsize(raw_voice_path) > 1000:
-                # Очистка и конвертация голоса
                 if not sanitize_voice_track(raw_voice_path, clean_voice_path): is_dj_turn = False
             else: is_dj_turn = False
         except: is_dj_turn = False
@@ -223,17 +222,20 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     else:
         fc.append(f"[m_raw]anull[pre_master]")
 
-    # 3. Master & Visualizer (ИСПРАВЛЕНА ОШИБКА overlay)
+    # 3. Master & Visualizer (ИСПРАВЛЕНО: убрал :format=yuv420p из оверлея)
     fc.append(f"[pre_master]loudnorm=I=-14:TP=-1.0:LRA=11[out_a]")
     fc.append(f"[out_a]asplit[a_fin][a_vis]")
     
     fc.append(f"color=s=1280x150:color=black@0.0[wbase]") 
     fc.append(f"[a_vis]showwaves=s=1280x150:mode=line:colors=0x00FFFF@0.8[wraw]")
     fc.append(f"[wbase][wraw]overlay=format=auto[w]")
-    # УБРАЛИ :format=yuv420p из самого фильтра overlay, так как это крашило FFmpeg
+    
+    # ВОТ ЗДЕСЬ БЫЛА ОШИБКА. Убираем :format=yuv420p из строки фильтра
     fc.append(f"[0:v][w]overlay=x=0:y=H-h[out_v]") 
 
     cmd += ["-filter_complex", ";".join(fc)]
+    
+    # Параметр пикселей передается здесь, в основных флагах
     cmd += ["-map", "[out_v]", "-map", "[a_fin]", "-shortest",
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", 
             "-c:a", "aac", "-b:a", "192k", "-f", "mpegts", final_path]
@@ -259,6 +261,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
 def worker_thread():
     print("🚀 Init Pool...")
     for i in range(len(VIBES_LIST)):
+        print(f"🌊 Gen {i}...")
         p = generate_segment(f"init_{i}", False, i)
         if p: video_queue.put(p)
     print("✅ Live.")
@@ -280,7 +283,7 @@ def worker_thread():
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # Флаги для предотвращения зависаний плеера Twitch
+    # Флаги для стабильности плеера
     cmd = [
         "ffmpeg", "-re", 
         "-fflags", "+genpts+igndts", 
