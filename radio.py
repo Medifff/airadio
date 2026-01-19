@@ -322,42 +322,58 @@ def streamer_thread():
         time.sleep(5)
     print("🔴 GOING LIVE!")
 
+    # 1. Мы убрали -c copy (это корень зла)
+    # 2. Добавили перекодировку видео (libx264, очень быстро) и аудио
+    # 3. Фильтр aresample выравнивает любые сбои аудио
     stream_cmd = [
         "ffmpeg",
-        "-fflags", "+genpts",
-        "-use_wallclock_as_timestamps", "1",
-        "-f", "mpegts", "-i", "pipe:0",
-        "-c", "copy",
+        "-re",                          # Читать вход с нормальной скоростью
+        "-fflags", "+genpts+discardcorrupt", # Игнорировать битые метки на входе
+        "-i", "pipe:0",                 # Читаем из Python
+        
+        # --- ВИДЕО ---
+        "-c:v", "libx264",              # Кодируем заново (создает новые PTS)
+        "-preset", "ultrafast",         # Минимальная нагрузка на CPU
+        "-tune", "zerolatency",         # Для стриминга
+        "-r", "30",                     # Жестко задаем 30 FPS
+        "-g", "60",                     # Keyframe каждые 2 сек (требование Twitch)
+        "-b:v", "3000k",                # Битрейт 3000kbps
+        "-pix_fmt", "yuv420p",
+        
+        # --- АУДИО ---
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-ar", "44100",
+        "-af", "aresample=async=1000",  # МАГИЯ: Лечит рассинхрон и щелчки
+        
         "-f", "flv", RTMP_URL
     ]
 
-    process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE)
+    # Важно: stderr=sys.stderr чтобы видеть ошибки, если они будут
+    process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE, stderr=sys.stderr)
 
     while True:
         seg_path = video_queue.get()
-        print(f"▶️ Playing: {seg_path} (Queue: {video_queue.qsize()})")
+        print(f"▶️ Playing: {seg_path}")
 
         try:
             with open(seg_path, "rb") as f:
                 while True:
-                    chunk = f.read(4096 * 10)
+                    chunk = f.read(4096 * 10) # Читаем большими кусками
                     if not chunk:
                         break
                     process.stdin.write(chunk)
             process.stdin.flush()
         except BrokenPipeError:
             print("❌ Stream broken. Restarting...")
-            process = subprocess.Popen(
-                stream_cmd, 
-                stdin=subprocess.PIPE, 
-                stdout=sys.stdout,  # Видеть логи FFmpeg в консоли
-                stderr=sys.stderr   # Видеть ошибки FFmpeg в консоли
-            )
+            # Тут можно добавить логику перезапуска, но с новым кодом падать не должно
+            process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE, stderr=sys.stderr)
         except Exception as e:
             print(f"❌ Streamer Error: {e}")
 
         if os.path.exists(seg_path):
             os.remove(seg_path)
+
 
 
 if __name__ == "__main__":
