@@ -231,7 +231,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
 
     cmd += ["-filter_complex", ";".join(fc)]
     
-    # WORKER: CPU Encode (OK for static image)
+    # WORKER: Safe CPU Encode for segments
     cmd += [
         "-map", "0:v", "-map", "[a_fin]", 
         "-t", "80", 
@@ -261,7 +261,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     return final_path
 
 def worker_thread():
-    print("🚀 Init Pool (Generating audio only)...", flush=True)
+    print("🚀 Init Pool...", flush=True)
     for i in range(len(VIBES_LIST)):
         print(f"🌊 Gen {i}...", flush=True)
         p = generate_segment(f"init_{i}", False, i)
@@ -283,23 +283,24 @@ def worker_thread():
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # === STREAMER FIX V18: CLEAN NVENC ===
-    # Убрали спорные флаги (-tune, -rc). Оставили только базу.
+    # === STREAMER FIX V19: NO LAG, NO CRASH ===
+    # 1. Removed "-re" (Causes slowdown on pipes)
+    # 2. Removed "-tune cbr" (Causes crash on NVENC)
+    # 3. Use simple NVENC settings
     cmd = [
-        "ffmpeg", "-re",
+        "ffmpeg", 
         "-fflags", "+genpts+igndts",
         "-use_wallclock_as_timestamps", "1",
         
         "-f", "mpegts", "-i", "pipe:0",
         
-        # NVENC (SAFE MODE)
-        "-c:v", "h264_nvenc", "-preset", "p3",
-        "-b:v", "3000k", "-minrate", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
+        # NVENC SIMPLE & FAST
+        "-c:v", "h264_nvenc", "-b:v", "3000k", "-minrate", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
         "-r", "30", "-g", "60",
         
-        # Audio (SAFE MODE)
+        # Audio: Sync without stretch
         "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-        "-af", "aresample=async=1000", # Soft sync
+        "-af", "aresample=async=0",
         
         "-f", "flv", RTMP_URL
     ]
