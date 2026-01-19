@@ -231,7 +231,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
 
     cmd += ["-filter_complex", ";".join(fc)]
     
-    # WORKER: Качественный TS файл
+    # WORKER: Создаем TS файл (CPU encode здесь норм, так как это статика)
     cmd += [
         "-map", "0:v", "-map", "[a_fin]", 
         "-t", "80", 
@@ -283,23 +283,24 @@ def worker_thread():
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # === STREAMER FIX V16.1: PERFECT SYNC + NVENC ===
-    # 1. Removed -re (No throttling)
-    # 2. NVENC CBR (Hardware Encoding)
-    # 3. aresample=async=0 (No stretching)
+    # === STREAMER FIX V17: CORRECT NVENC SYNTAX ===
+    # Исправлена ошибка "-tune cbr". Теперь используем "-rc cbr".
     cmd = [
-        "ffmpeg",
+        "ffmpeg", 
         "-fflags", "+genpts+igndts",
         "-use_wallclock_as_timestamps", "1",
         
         "-f", "mpegts", "-i", "pipe:0",
         
-        # NVENC: Hardware Acceleration on RTX A4000
-        "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "cbr",
+        # NVENC SETTINGS
+        "-c:v", "h264_nvenc", 
+        "-preset", "p3",       # Preset: p1 (fastest) to p7 (slowest)
+        "-rc", "cbr",          # Rate Control: CBR (Constant Bitrate)
         "-b:v", "3000k", "-minrate", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
+        
         "-r", "30", "-g", "60",
         
-        # AUDIO: No stretching, just clean pass-through or linear resample
+        # Audio: No stretch (async=0)
         "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
         "-af", "aresample=async=0:first_pts=0",
         
