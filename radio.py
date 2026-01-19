@@ -48,7 +48,7 @@ print(f"⚙️ Device: {DEVICE}", flush=True)
 video_queue = queue.Queue(maxsize=4)
 user_prompt_queue = queue.Queue(maxsize=1)
 GENRE_POOL = {} 
-GENRE_IMAGES = {} # Кэш картинок
+GENRE_IMAGES = {} 
 POOL_LOCK = threading.Lock()
 TRACKS_BEFORE_DJ = 3 
 
@@ -56,7 +56,6 @@ TRACKS_BEFORE_DJ = 3
 # 2. VIBES
 # =========================
 quality_suffix = ", high quality studio recording, clear stereo image, professional mix, no fade out"
-# (Prompt, Visual Prompt)
 VIBES_LIST = [
     (f"punk rock, fast tempo, distorted electric guitars, live drum kit{quality_suffix}", "punk rock poster, anarchy symbol, graffiti, red and black"),
     (f"post-punk, dark wave, chorus guitar, driving bassline, melancholic{quality_suffix}", "post-punk album cover, monochrome, brutalist architecture"),
@@ -97,42 +96,31 @@ def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
 
-# --- PRE-GENERATE IMAGES ---
 def init_images():
     print("🎨 Generating Genre Covers (One-time)...", flush=True)
     cleanup()
-    
-    # Грузим SD только на время генерации обложек
     pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, use_safetensors=True).to(DEVICE)
     pipe.safety_checker = None
-
-    # Генерируем 5 обложек для жанров
-    for i, (audio_prompt, visual_prompt) in enumerate(VIBES_LIST):
+    for i, (_, visual_prompt) in enumerate(VIBES_LIST):
         path = os.path.join(WORKDIR, f"cover_genre_{i}.png")
         if not os.path.exists(path):
-            print(f"   - Cover {i}: {visual_prompt[:20]}...", flush=True)
+            print(f"   - Cover {i}...", flush=True)
             pipe(f"{visual_prompt}, masterpiece, 8k, wallpaper", num_inference_steps=25).images[0].save(path)
         GENRE_IMAGES[i] = path
-
-    # Генерируем 1 обложку для "User Request"
     req_path = os.path.join(WORKDIR, "cover_request.png")
     if not os.path.exists(req_path):
         pipe("Abstract AI art, digital soundwaves, neon cyber, masterpiece", num_inference_steps=25).images[0].save(req_path)
     GENRE_IMAGES["request"] = req_path
-
-    # УДАЛЯЕМ SD ИЗ ПАМЯТИ НАВСЕГДА
     del pipe
     cleanup()
-    print("🎨 Covers ready. SD unloaded. VRAM freed.", flush=True)
+    print("🎨 Covers ready.", flush=True)
 
-# Запускаем генерацию картинок сразу
 init_images()
 
 print("⏳ Loading Stable Audio (CPU)...", flush=True)
 audio_model, model_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
 sample_rate = model_config["sample_rate"]
 sample_size = model_config["sample_size"]
-# Модель живет на CPU, прыгает на GPU только для работы
 audio_model = audio_model.to("cpu").eval() 
 
 # =========================
@@ -166,19 +154,14 @@ def gen_music(prompt, out_wav, duration_sec=45):
     print(f"🎧 StableAudio Generating...", flush=True)
     cleanup()
     try:
-        # Swap In
         audio_model.to(DEVICE)
-        
         with torch.no_grad():
             out = generate_diffusion_cond(
                 audio_model, steps=100, cfg_scale=5.5, conditioning=[{"prompt": prompt, "seconds_start": 0, "seconds_total": duration_sec}],
                 sample_size=sample_size, sigma_min=0.3, sigma_max=500, sampler_type="dpmpp-3m-sde", device=DEVICE
             )
-        
-        # Swap Out (сразу освобождаем GPU)
         audio_model.to("cpu")
         cleanup()
-
         out = rearrange(out, "b d n -> d (b n)").to(torch.float32).div(torch.max(torch.abs(out))).clamp(-1, 1)
         sf.write(out_wav, out.cpu().numpy().T, sample_rate, subtype='PCM_16')
         return True
@@ -190,12 +173,7 @@ def gen_music(prompt, out_wav, duration_sec=45):
         return False
 
 def sanitize_voice_track(raw_path, clean_path):
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error", "-i", raw_path,
-        "-ar", "44100", "-ac", "2",
-        "-af", "highpass=f=100,lowpass=f=7000,volume=1.8,acompressor=threshold=-16dB:ratio=6:attack=5:release=80",
-        clean_path
-    ]
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", raw_path, "-ar", "44100", "-ac", "2", "-af", "highpass=f=100,lowpass=f=7000,volume=1.8,acompressor=threshold=-16dB:ratio=6:attack=5:release=80", clean_path]
     try: subprocess.run(cmd, check=True); return True
     except: return False
 
@@ -203,17 +181,16 @@ def sanitize_voice_track(raw_path, clean_path):
 # 7. WORKER
 # =========================
 def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
-    # 1. Vibes & Image Selection
     if not user_prompt_queue.empty() and forced_genre_idx is None:
         order = user_prompt_queue.get()
         prompt, genre_idx = f"{order['prompt']}, {quality_suffix}", -1
-        cover_file = GENRE_IMAGES["request"] # Используем готовую картинку для реквестов
+        cover_file = GENRE_IMAGES["request"]
         is_dj_turn = True
     else:
         idx = forced_genre_idx if forced_genre_idx is not None else random.randint(0, len(VIBES_LIST)-1)
         prompt, _ = VIBES_LIST[idx]
         genre_idx = idx
-        cover_file = GENRE_IMAGES[idx] # Используем кэшированную картинку
+        cover_file = GENRE_IMAGES[idx]
         order = None
 
     music_path = os.path.join(WORKDIR, f"m_{segment_id}.wav")
@@ -221,12 +198,8 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
     clean_voice_path = os.path.join(WORKDIR, f"v_clean_{segment_id}.wav")
     final_path = os.path.join(WORKDIR, f"seg_{segment_id}.ts")
 
-    # A. Music
     if not gen_music(prompt, music_path): return None
 
-    # B. Cover (SKIPPED - Already generated)
-    
-    # C. DJ Logic
     if is_dj_turn:
         try:
             mood = prompt.split(",")[0]
@@ -238,21 +211,17 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
             else: is_dj_turn = False
         except: is_dj_turn = False
 
-    # D. Assembly (LITE MODE - No Visualizer)
-    # -tune stillimage оптимизирует кодирование статичной картинки (почти 0 CPU)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", cover_file]
-    if is_dj_turn: cmd += ["-i", clean_voice_path] # [1]
-    cmd += ["-i", music_path, "-i", music_path]    # [2], [3]
+    if is_dj_turn: cmd += ["-i", clean_voice_path]
+    cmd += ["-i", music_path, "-i", music_path]
 
     fc = []
     m1, m2 = ("2", "3") if is_dj_turn else ("1", "2")
     
-    # 1. Music Loop (Simple)
     fc.append(f"[{m1}:a]anull[a_main]")
     fc.append(f"[{m2}:a]atrim=start=5,asetpts=PTS-STARTPTS[a_loop]")
     fc.append(f"[a_main][a_loop]acrossfade=d=5:c1=tri:c2=tri[m_raw]")
     
-    # 2. Voice Mix (Simple Audio Only)
     if is_dj_turn:
         fc.append(f"[1:a]asplit[v_sc][v_mix]")
         fc.append(f"[m_raw][v_sc]sidechaincompress=threshold=0.05:ratio=10:attack=5:release=300[m_duck]")
@@ -262,12 +231,12 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
 
     cmd += ["-filter_complex", ";".join(fc)]
     
-    # Video settings optimized for static image
+    # WORKER: Качественный TS файл
     cmd += [
         "-map", "0:v", "-map", "[a_fin]", 
         "-t", "80", 
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", # <-- Super Fast Video
-        "-pix_fmt", "yuv420p", "-r", "10", "-g", "20", # 10 FPS достаточно для статики
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", 
         "-c:a", "aac", "-b:a", "192k", 
         "-f", "mpegts", final_path
     ]
@@ -278,7 +247,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
         if is_dj_turn: return generate_segment(segment_id, False, genre_idx)
         return None
 
-    for f in [music_path, raw_voice_path, clean_voice_path]: # Не удаляем cover_file!
+    for f in [music_path, raw_voice_path, clean_voice_path]:
         if os.path.exists(f): os.remove(f)
     cleanup()
 
@@ -286,7 +255,6 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
         with POOL_LOCK:
             old = GENRE_POOL.get(genre_idx)
             GENRE_POOL[genre_idx] = final_path
-            # Старые видео файлы удаляем
             if old and old != final_path and os.path.exists(old): 
                 try: os.remove(old)
                 except: pass
@@ -302,9 +270,7 @@ def worker_thread():
     
     idx, cnt = 0, 0
     while True:
-        if video_queue.full(): 
-            time.sleep(2)
-            continue
+        if video_queue.full(): time.sleep(2); continue
         try:
             dj = (cnt >= TRACKS_BEFORE_DJ)
             p = generate_segment(f"s_{idx}", dj)
@@ -317,12 +283,25 @@ def worker_thread():
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
+    # === STREAMER FIX V15: TWITCH BROADCAST STANDARDS ===
     cmd = [
-        "ffmpeg", "-re", 
-        "-fflags", "+genpts+igndts", 
+        "ffmpeg", "-re",
+        "-fflags", "+genpts",
         "-use_wallclock_as_timestamps", "1",
-        "-f", "mpegts", "-i", "pipe:0", 
-        "-c", "copy", 
+        
+        "-f", "mpegts", "-i", "pipe:0",
+        
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-b:v", "3000k", "-minrate", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
+        
+        # GOP and Keyframe Enforcement for Twitch
+        "-g", "60", "-keyint_min", "60", "-sc_threshold", "0", "-r", "30",
+        
+        "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
+        
+        "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+        "-af", "aresample=async=1:first_pts=0",
+        
         "-f", "flv", RTMP_URL
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -331,18 +310,21 @@ def streamer_thread():
         use_pool = False
         path = None
         
-        if not video_queue.empty():
-            path = video_queue.get()
+        if not video_queue.empty(): path = video_queue.get()
         elif GENRE_POOL:
             with POOL_LOCK:
-                genre = random.choice(list(GENRE_POOL.keys()))
-                path = GENRE_POOL[genre]
+                path = GENRE_POOL[random.choice(list(GENRE_POOL.keys()))]
                 use_pool = True
                 print(f"♻️ Pool: {path}", flush=True)
         
-        if not path or not os.path.exists(path):
-            time.sleep(1)
-            continue
+        if not path or not os.path.exists(path): time.sleep(1); continue
+
+        # ЗАЩИТА ОТ БИТЫХ ФАЙЛОВ
+        if os.path.getsize(path) < 100 * 1024:
+             print(f"⚠️ Skipping broken segment (too small): {path}", flush=True)
+             try: os.remove(path)
+             except: pass
+             continue
 
         try:
             with open(path, "rb") as f:
@@ -356,7 +338,6 @@ def streamer_thread():
             if not use_pool and os.path.exists(path):
                 try: os.remove(path)
                 except: pass
-                
         except Exception as e:
             print(f"Stream error: {e}", flush=True)
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
