@@ -231,7 +231,7 @@ def generate_segment(segment_id, is_dj_turn, forced_genre_idx=None):
 
     cmd += ["-filter_complex", ";".join(fc)]
     
-    # WORKER: Создаем TS файл (CPU encode здесь норм, так как это статика)
+    # WORKER: CPU Encode (OK for static image)
     cmd += [
         "-map", "0:v", "-map", "[a_fin]", 
         "-t", "80", 
@@ -283,26 +283,23 @@ def worker_thread():
 def streamer_thread():
     while video_queue.empty() and not GENRE_POOL: time.sleep(5)
     
-    # === STREAMER FIX V17: CORRECT NVENC SYNTAX ===
-    # Исправлена ошибка "-tune cbr". Теперь используем "-rc cbr".
+    # === STREAMER FIX V18: CLEAN NVENC ===
+    # Убрали спорные флаги (-tune, -rc). Оставили только базу.
     cmd = [
-        "ffmpeg", 
+        "ffmpeg", "-re",
         "-fflags", "+genpts+igndts",
         "-use_wallclock_as_timestamps", "1",
         
         "-f", "mpegts", "-i", "pipe:0",
         
-        # NVENC SETTINGS
-        "-c:v", "h264_nvenc", 
-        "-preset", "p3",       # Preset: p1 (fastest) to p7 (slowest)
-        "-rc", "cbr",          # Rate Control: CBR (Constant Bitrate)
+        # NVENC (SAFE MODE)
+        "-c:v", "h264_nvenc", "-preset", "p3",
         "-b:v", "3000k", "-minrate", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
-        
         "-r", "30", "-g", "60",
         
-        # Audio: No stretch (async=0)
+        # Audio (SAFE MODE)
         "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
-        "-af", "aresample=async=0:first_pts=0",
+        "-af", "aresample=async=1000", # Soft sync
         
         "-f", "flv", RTMP_URL
     ]
