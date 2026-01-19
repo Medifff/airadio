@@ -4,32 +4,30 @@ import random
 import subprocess
 import gc
 import soundfile as sf
-import numpy as np
 import threading
 import queue
 import asyncio
 import torch
+
 from einops import rearrange
 from diffusers import StableDiffusionPipeline
 import edge_tts
 from crewai import Agent, Task, Crew
 from huggingface_hub import login
-from stable_audio_tools import get_pretrained_model
-from stable_audio_tools.inference.generation import generate_diffusion_cond
 from twitchio.ext import commands
 
-# =========================
-# 0. ENV FIXES (CRITICAL)
-# =========================
-os.environ["HF_HOME"] = "/workspace/hf_cache"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
+from stable_audio_tools import get_pretrained_model
+from stable_audio_tools.inference.generation import generate_diffusion_cond
 
 # =========================
-# 1. CONFIG
+# CONFIG
 # =========================
+
+os.environ["HF_HOME"] = "/workspace/hf_cache"
+
 STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TWITCH_TOKEN = os.environ.get("TWITCH_TOKEN")
 CHANNEL_NAME = os.environ.get("TWITCH_CHANNEL") or "mediff23"
 
@@ -38,109 +36,276 @@ WORKDIR = "/workspace/airadio/data"
 os.makedirs(WORKDIR, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"⚙️ Device: {DEVICE}", flush=True)
 
-video_queue = queue.Queue(maxsize=4)
+video_queue = queue.Queue(maxsize=3)
 user_prompt_queue = queue.Queue(maxsize=1)
-GENRE_IMAGES = {}
-POOL_LOCK = threading.Lock()
+
+TRACKS_BEFORE_DJ = 3
 
 # =========================
-# 2. VIBES
+# VIBES
 # =========================
-quality_suffix = ", high quality studio recording, clear stereo image, professional mix"
-VIBES_LIST = [
-    (f"punk rock, fast tempo, distorted electric guitars{quality_suffix}", "punk rock poster graffiti red black"),
-    (f"post-punk, dark wave, melancholic bassline{quality_suffix}", "post punk brutalist monochrome"),
-    (f"happy hardcore, 170bpm rave energy{quality_suffix}", "neon rave lasers"),
-    (f"industrial rock, cyberpunk metal{quality_suffix}", "cyberpunk guitarist neon"),
-    (f"liquid drum and bass, deep sub bass{quality_suffix}", "futuristic tunnel speed")
+
+QUALITY = ", high quality studio recording, clear stereo image, professional mix"
+
+VIBES = [
+    "post-punk, dark wave, chorus guitar, melancholic",
+    "drum and bass, liquid dnb, deep sub bass",
+    "electronic rock, industrial metal",
+    "happy hardcore, 170 bpm, rave",
 ]
 
 # =========================
-# 3. INIT IMAGES (ONCE)
+# TWITCH BOT
 # =========================
-def init_images():
-    pipe = StableDiffusionPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        torch_dtype=torch.float16
-    ).to(DEVICE)
-    pipe.safety_checker = None
 
-    for i, (_, prompt) in enumerate(VIBES_LIST):
-        path = f"{WORKDIR}/cover_{i}.png"
-        if not os.path.exists(path):
-            pipe(prompt + ", masterpiece", num_inference_steps=20).images[0].save(path)
-        GENRE_IMAGES[i] = path
+class Bot(commands.Bot):
+    def __init__(self):
+        super().__init__(
+            token=TWITCH_TOKEN,
+            prefix="!",
+            initial_channels=[CHANNEL_NAME],
+        )
 
-    req = f"{WORKDIR}/cover_request.png"
-    if not os.path.exists(req):
-        pipe("abstract ai radio cyberpunk", num_inference_steps=20).images[0].save(req)
-    GENRE_IMAGES["request"] = req
+    async def event_ready(self):
+        print(f"🎮 Twitch bot ready: {self.nick}", flush=True)
 
-    del pipe
+    @commands.command(name="vibe")
+    async def vibe(self, ctx):
+        prompt = ctx.message.content.replace("!vibe", "").strip()[:80]
+        if len(prompt) < 3:
+            return
+        if user_prompt_queue.empty():
+            user_prompt_queue.put(prompt)
+            await ctx.send(f"🎧 Next vibe accepted: {prompt}")
+
+def run_twitch_bot():
+    if not TWITCH_TOKEN:
+        return
+    asyncio.run(Bot().start())
+
+# =========================
+# MODELS
+# =========================
+
+def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
 
-init_images()
+if HF_TOKEN:
+    login(token=HF_TOKEN)
 
-# =========================
-# 4. AUDIO MODEL
-# =========================
-audio_model, model_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
-sample_rate = model_config["sample_rate"]
-sample_size = model_config["sample_size"]
+print("⏳ Loading Stable Audio…", flush=True)
+audio_model, cfg = get_pretrained_model("stabilityai/stable-audio-open-1.0")
 audio_model = audio_model.to("cpu").eval()
 
+SAMPLE_RATE = cfg["sample_rate"]
+SAMPLE_SIZE = cfg["sample_size"]
+
 # =========================
-# 5. DJ AI
+# DJ
 # =========================
+
 class CrewAIDJ:
     def __init__(self):
-        self.fallback = [
-            "Signal stable.",
-            "Neural channel active.",
-            "Music is data.",
-            "Type !vibe in chat."
-        ]
-        self.agent = Agent(
-            role="Cyberpunk Radio Host",
-            goal="Short radio phrases",
-            backstory="AI DJ Nexus",
-            verbose=False
-        ) if OPENAI_API_KEY else None
+        self.agent = None
+        if OPENAI_API_KEY:
+            self.agent = Agent(
+                role="AI Radio DJ",
+                goal="Short radio announcements",
+                backstory="Cyberpunk radio host",
+                verbose=False,
+            )
 
-    def script(self, mood):
+    def speak(self, vibe):
         if not self.agent:
-            return random.choice(self.fallback)
+            return "Switching frequency."
         task = Task(
-            description=f"Radio phrase. Mood: {mood}. Max 1 sentence.",
+            description=f"Announce next track. Vibe: {vibe}. Max 1 sentence.",
             agent=self.agent,
-            expected_output="Text"
+            expected_output="Short line",
         )
         try:
             return str(Crew([self.agent], [task]).kickoff())
         except:
-            return random.choice(self.fallback)
+            return "Switching frequency."
 
 dj = CrewAIDJ()
 
 # =========================
-# 6. MUSIC GEN
+# AUDIO
 # =========================
-def gen_music(prompt, path, dur=80):
-    audio_model.to(DEVICE)
-    with torch.no_grad():
-        out = generate_diffusion_cond(
-            audio_model,
-            steps=60,
-            cfg_scale=5.5,
-            conditioning=[{"prompt": prompt, "seconds_total": dur}],
-            sample_size=sample_size,
-            sigma_min=0.3,
-            sigma_max=200,
-            device=DEVICE
-        )
-    audio_model.to("cpu")
-    out = rearrange(out, "b d n -> d (b n)")
-    out = out / torch
+
+def generate_music(prompt, out_wav, seconds=40):
+    cleanup()
+    try:
+        audio_model.to(DEVICE)
+        with torch.no_grad():
+            audio = generate_diffusion_cond(
+                audio_model,
+                steps=80,
+                cfg_scale=5.5,
+                conditioning=[{
+                    "prompt": prompt,
+                    "seconds_start": 0,
+                    "seconds_total": seconds
+                }],
+                sample_size=SAMPLE_SIZE,
+                sigma_min=0.3,
+                sigma_max=500,
+                sampler_type="dpmpp-3m-sde",
+                device=DEVICE
+            )
+        audio_model.to("cpu")
+        cleanup()
+
+        audio = rearrange(audio, "b d n -> d (b n)")
+        audio = audio / audio.abs().max()
+        sf.write(out_wav, audio.cpu().numpy().T, SAMPLE_RATE)
+        return True
+    except Exception as e:
+        print("❌ Music error:", e, flush=True)
+        audio_model.to("cpu")
+        cleanup()
+        return False
+
+# =========================
+# SEGMENT
+# =========================
+
+def generate_segment(idx, with_dj):
+    vibe = random.choice(VIBES)
+    if not user_prompt_queue.empty():
+        vibe = user_prompt_queue.get()
+
+    music = f"{WORKDIR}/music_{idx}.wav"
+    voice = f"{WORKDIR}/voice_{idx}.wav"
+    out_ts = f"{WORKDIR}/seg_{idx}.ts"
+
+    if not generate_music(vibe + QUALITY, music):
+        return None
+
+    inputs = ["-i", music]
+
+    filters = []
+
+    if with_dj:
+        text = dj.speak(vibe)
+        asyncio.run(edge_tts.Communicate(text, "en-US-ChristopherNeural").save(voice))
+        inputs = ["-i", voice, "-i", music]
+        filters.append("[1:a][0:a]amix=inputs=2:duration=first[a]")
+
+    else:
+        filters.append("[0:a]anull[a]")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        *inputs,
+        "-filter_complex", ";".join(filters),
+        "-map", "0:v?" ,
+        "-map", "[a]",
+        "-f", "lavfi",
+        "-i", "color=c=black:s=512x512:r=30",
+        "-shortest",
+
+        "-vsync", "cfr",
+        "-r", "30",
+
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+        "-g", "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0",
+        "-x264-params", "repeat-headers=1",
+
+        "-c:a", "aac",
+        "-ar", "44100",
+        "-ac", "2",
+        "-b:a", "160k",
+
+        "-f", "mpegts",
+        "-mpegts_flags", "+resend_headers",
+        out_ts
+    ]
+
+    subprocess.run(cmd, check=True)
+    os.remove(music)
+    if os.path.exists(voice):
+        os.remove(voice)
+
+    return out_ts
+
+# =========================
+# WORKER
+# =========================
+
+def worker():
+    idx = 0
+    count = 0
+    while True:
+        if video_queue.full():
+            time.sleep(1)
+            continue
+        with_dj = count >= TRACKS_BEFORE_DJ
+        seg = generate_segment(idx, with_dj)
+        if seg:
+            video_queue.put(seg)
+            idx += 1
+            count = 0 if with_dj else count + 1
+
+# =========================
+# STREAMER (ONE ENCODER)
+# =========================
+
+def streamer():
+    while video_queue.empty():
+        time.sleep(2)
+
+    cmd = [
+        "ffmpeg",
+        "-fflags", "+genpts+igndts",
+        "-f", "mpegts",
+        "-i", "pipe:0",
+
+        "-vsync", "cfr",
+        "-r", "30",
+
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+        "-g", "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0",
+        "-b:v", "3000k",
+        "-maxrate", "3000k",
+        "-bufsize", "6000k",
+
+        "-c:a", "aac",
+        "-ar", "44100",
+        "-ac", "2",
+        "-b:a", "160k",
+        "-af", "aresample=async=1:first_pts=0",
+
+        "-f", "flv",
+        RTMP_URL
+    ]
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    while True:
+        seg = video_queue.get()
+        with open(seg, "rb") as f:
+            proc.stdin.write(f.read())
+        proc.stdin.flush()
+        os.remove(seg)
+
+# =========================
+# MAIN
+# =========================
+
+if __name__ == "__main__":
+    threading.Thread(target=run_twitch_bot, daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()
+    streamer()
