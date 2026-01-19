@@ -1,10 +1,10 @@
 import os
 import time
 import random
+import socket
 import subprocess
 import threading
 import queue
-import asyncio
 import gc
 
 import torch
@@ -12,9 +12,7 @@ import soundfile as sf
 from einops import rearrange
 
 import edge_tts
-from twitchio.ext import commands
 from huggingface_hub import login
-
 from stable_audio_tools import get_pretrained_model
 from stable_audio_tools.inference.generation import generate_diffusion_cond
 
@@ -22,12 +20,12 @@ from stable_audio_tools.inference.generation import generate_diffusion_cond
 # CONFIG
 # =========================
 
-os.environ["HF_HOME"] = "/workspace/hf_cache"
-
-STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN")
-TWITCH_TOKEN = os.environ.get("TWITCH_TOKEN")
+STREAM_KEY = os.environ["TWITCH_STREAM_KEY"]
+TWITCH_OAUTH = os.environ["TWITCH_OAUTH"]      # oauth:xxxx
+TWITCH_NICK = os.environ["TWITCH_NICK"]
 CHANNEL = os.environ.get("TWITCH_CHANNEL", "mediff23")
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 RTMP_URL = f"rtmp://live.twitch.tv/app/{STREAM_KEY}"
 WORKDIR = "/workspace/airadio/data"
@@ -35,9 +33,10 @@ os.makedirs(WORKDIR, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-TRACKS_BEFORE_DJ = 3
 audio_queue = queue.Queue(maxsize=2)
 prompt_queue = queue.Queue(maxsize=1)
+
+TRACKS_BEFORE_DJ = 3
 
 # =========================
 # VIBES
@@ -53,32 +52,32 @@ VIBES = [
 ]
 
 # =========================
-# TWITCH BOT
+# TWITCH IRC (NO CRASH)
 # =========================
 
-class Bot(commands.Bot):
-    def __init__(self):
-        super().__init__(
-            token=TWITCH_TOKEN,
-            prefix="!",
-            initial_channels=[CHANNEL],
-        )
+def twitch_irc():
+    s = socket.socket()
+    s.connect(("irc.chat.twitch.tv", 6667))
+    s.send(f"PASS {TWITCH_OAUTH}\r\n".encode())
+    s.send(f"NICK {TWITCH_NICK}\r\n".encode())
+    s.send(f"JOIN #{CHANNEL}\r\n".encode())
 
-    async def event_ready(self):
-        print(f"🎮 Twitch bot ready: {self.nick}", flush=True)
+    print("🎮 Twitch IRC connected", flush=True)
 
-    @commands.command(name="vibe")
-    async def vibe(self, ctx):
-        text = ctx.message.content.replace("!vibe", "").strip()[:80]
-        if len(text) < 3:
-            return
-        if prompt_queue.empty():
-            prompt_queue.put(text)
-            await ctx.send(f"🎧 Accepted: {text}")
+    while True:
+        data = s.recv(2048).decode(errors="ignore")
+        if data.startswith("PING"):
+            s.send("PONG\r\n".encode())
+            continue
 
-def run_twitch_bot():
-    if TWITCH_TOKEN:
-        asyncio.run(Bot().start())
+        if "!vibe" in data:
+            try:
+                msg = data.split("!vibe", 1)[1].strip()
+                if len(msg) > 3 and prompt_queue.empty():
+                    prompt_queue.put(msg[:80])
+                    print(f"🎧 Chat vibe: {msg}", flush=True)
+            except:
+                pass
 
 # =========================
 # MODEL
@@ -122,6 +121,7 @@ def generate_music(prompt, path, seconds=40):
                 sampler_type="dpmpp-3m-sde",
                 device=DEVICE
             )
+
         audio_model.to("cpu")
         cleanup()
 
@@ -149,40 +149,36 @@ def worker():
             continue
 
         vibe = random.choice(VIBES)
-        user_prompt = None
 
         if not prompt_queue.empty():
-            user_prompt = prompt_queue.get()
-            vibe = user_prompt
+            vibe = prompt_queue.get()
 
         with_dj = count >= TRACKS_BEFORE_DJ
 
-        music_path = f"{WORKDIR}/music_{idx}.wav"
-        voice_path = f"{WORKDIR}/voice_{idx}.wav"
+        music = f"{WORKDIR}/music_{idx}.wav"
+        voice = f"{WORKDIR}/voice_{idx}.wav"
 
-        if not generate_music(vibe + QUALITY, music_path):
+        if not generate_music(vibe + QUALITY, music):
             continue
 
         if with_dj:
             text = f"Next track. {vibe}"
-            asyncio.run(
-                edge_tts.Communicate(
-                    text, "en-US-ChristopherNeural"
-                ).save(voice_path)
-            )
+            edge_tts.Communicate(
+                text, "en-US-ChristopherNeural"
+            ).save_sync(voice)
         else:
-            voice_path = None
+            voice = None
 
-        audio_queue.put((music_path, voice_path))
+        audio_queue.put((music, voice))
         idx += 1
         count = 0 if with_dj else count + 1
 
 # =========================
-# STREAMER (ONE FFMPEG)
+# STREAMER (SINGLE FFMPEG)
 # =========================
 
 def streamer():
-    print("📡 Starting stream…", flush=True)
+    print("📡 Streaming started", flush=True)
 
     cmd = [
         "ffmpeg",
@@ -192,18 +188,14 @@ def streamer():
         "-i", "color=c=black:s=512x512:r=30",
         "-f", "wav",
         "-i", "pipe:0",
-
         "-shortest",
-        "-vsync", "cfr",
-        "-r", "30",
 
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
-        "-g", "60",
-        "-keyint_min", "60",
-        "-sc_threshold", "0",
         "-pix_fmt", "yuv420p",
+        "-r", "30",
+        "-g", "60",
 
         "-c:a", "aac",
         "-ar", "44100",
@@ -218,22 +210,17 @@ def streamer():
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     while True:
-        music_path, voice_path = audio_queue.get()
-
-        with open(music_path, "rb") as f:
+        music, _ = audio_queue.get()
+        with open(music, "rb") as f:
             proc.stdin.write(f.read())
-
         proc.stdin.flush()
-        os.remove(music_path)
-
-        if voice_path and os.path.exists(voice_path):
-            os.remove(voice_path)
+        os.remove(music)
 
 # =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
-    threading.Thread(target=run_twitch_bot, daemon=True).start()
+    threading.Thread(target=twitch_irc, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
     streamer()
