@@ -10,9 +10,7 @@ import asyncio
 import torch
 
 from einops import rearrange
-from diffusers import StableDiffusionPipeline
 import edge_tts
-from crewai import Agent, Task, Crew
 from huggingface_hub import login
 from twitchio.ext import commands
 
@@ -27,7 +25,6 @@ os.environ["HF_HOME"] = "/workspace/hf_cache"
 
 STREAM_KEY = os.environ.get("TWITCH_STREAM_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TWITCH_TOKEN = os.environ.get("TWITCH_TOKEN")
 CHANNEL_NAME = os.environ.get("TWITCH_CHANNEL") or "mediff23"
 
@@ -103,36 +100,6 @@ SAMPLE_RATE = cfg["sample_rate"]
 SAMPLE_SIZE = cfg["sample_size"]
 
 # =========================
-# DJ
-# =========================
-
-class CrewAIDJ:
-    def __init__(self):
-        self.agent = None
-        if OPENAI_API_KEY:
-            self.agent = Agent(
-                role="AI Radio DJ",
-                goal="Short radio announcements",
-                backstory="Cyberpunk radio host",
-                verbose=False,
-            )
-
-    def speak(self, vibe):
-        if not self.agent:
-            return "Switching frequency."
-        task = Task(
-            description=f"Announce next track. Vibe: {vibe}. Max 1 sentence.",
-            agent=self.agent,
-            expected_output="Short line",
-        )
-        try:
-            return str(Crew([self.agent], [task]).kickoff())
-        except:
-            return "Switching frequency."
-
-dj = CrewAIDJ()
-
-# =========================
 # AUDIO
 # =========================
 
@@ -185,28 +152,28 @@ def generate_segment(idx, with_dj):
     if not generate_music(vibe + QUALITY, music):
         return None
 
-    inputs = ["-i", music]
+    inputs = [
+        "-f", "lavfi",
+        "-i", "color=c=black:s=512x512:r=30",
+        "-i", music,
+    ]
 
-    filters = []
+    fc = []
 
     if with_dj:
-        text = dj.speak(vibe)
+        text = f"Next track. {vibe}"
         asyncio.run(edge_tts.Communicate(text, "en-US-ChristopherNeural").save(voice))
-        inputs = ["-i", voice, "-i", music]
-        filters.append("[1:a][0:a]amix=inputs=2:duration=first[a]")
-
+        inputs += ["-i", voice]
+        fc.append("[1:a][2:a]amix=inputs=2:duration=first[a]")
     else:
-        filters.append("[0:a]anull[a]")
+        fc.append("[1:a]anull[a]")
 
     cmd = [
         "ffmpeg", "-y",
-        "-fflags", "+genpts",
         *inputs,
-        "-filter_complex", ";".join(filters),
-        "-map", "0:v?" ,
+        "-filter_complex", ";".join(fc),
+        "-map", "0:v",
         "-map", "[a]",
-        "-f", "lavfi",
-        "-i", "color=c=black:s=512x512:r=30",
         "-shortest",
 
         "-vsync", "cfr",
@@ -231,6 +198,7 @@ def generate_segment(idx, with_dj):
     ]
 
     subprocess.run(cmd, check=True)
+
     os.remove(music)
     if os.path.exists(voice):
         os.remove(voice)
@@ -256,7 +224,7 @@ def worker():
             count = 0 if with_dj else count + 1
 
 # =========================
-# STREAMER (ONE ENCODER)
+# STREAMER
 # =========================
 
 def streamer():
