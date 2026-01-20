@@ -173,8 +173,8 @@ def gen_music_stable_audio(prompt, out_wav, duration_sec=45):
     with torch.no_grad():
         output = generate_diffusion_cond(
             audio_model,
-            steps=150,          # 📌 Suggestion 4: Quality Steps
-            cfg_scale=5.5,      # 📌 Suggestion 4: Musicality Sweet Spot
+            steps=50,           # <--- ИЗМЕНЕНО: Было 150, стало 50 (Ускорение в 3 раза)
+            cfg_scale=5.0,      # Чуть снизил для стабильности на малых шагах
             conditioning=conditioning,
             sample_size=sample_size,
             sigma_min=0.3,
@@ -318,7 +318,7 @@ def worker_thread():
 # =========================
 def streamer_thread():
     print("📡 Streamer started. Buffering...")
-    # Ждем, пока будет хотя бы 2 сегмента, чтобы был запас
+    # Ждем 2 сегмента для безопасности
     while video_queue.qsize() < 2:
         print(f"⏳ Buffering... ({video_queue.qsize()}/2)")
         time.sleep(5)
@@ -326,27 +326,27 @@ def streamer_thread():
 
     stream_cmd = [
         "ffmpeg",
-        "-re",                          # Читать вход в реальном времени (важно для pipe)
-        "-fflags", "+genpts+discardcorrupt", # Лечим входные баги
-        "-i", "pipe:0",                 # Читаем из Python
+        "-re",                          # Читаем в реалтайме (эмулируем)
+        "-fflags", "+genpts+discardcorrupt", 
+        "-i", "pipe:0",                 
         
-        # --- ВИДЕО (NVENC - Hardware) ---
-        "-c:v", "h264_nvenc",           # Используем GPU NVIDIA!
-        "-preset", "p1",                # p1 = самый быстрый пресет NVENC
-        "-tune", "ll",                  # Low Latency
-        "-r", "30",                     # Жесткие 30 FPS
-        "-g", "60",                     # Keyframe каждые 2 сек
-        "-b:v", "2500k",                # Битрейт чуть ниже для стабильности
+        # --- ВИДЕО (NVENC) ---
+        "-c:v", "h264_nvenc",           
+        "-preset", "p1",                # Максимальная скорость
+        "-tune", "ll",                  
+        "-r", "30",                     # Жестко 30 FPS
+        "-g", "60",                     
+        "-b:v", "2500k",                
         "-pix_fmt", "yuv420p",
         
-        # Лечение времени видео: создаем новые PTS, начиная с 0
-        "-vf", "setpts=N/FPS/TB", 
+        # --- ФИКС ОШИБКИ ТУТ ---
+        # Мы заменили FPS на 30, так как задали -r 30 выше
+        "-vf", "setpts=N/30/TB",        
 
         # --- АУДИО ---
         "-c:a", "aac",
-        "-b:a", "128k",                 # 128k достаточно для стрима
+        "-b:a", "128k",                 
         "-ar", "44100",
-        # Лечение времени аудио: выравнивание и заполнение дыр
         "-af", "aresample=async=1000",
         
         "-f", "flv", RTMP_URL
@@ -355,7 +355,6 @@ def streamer_thread():
     process = subprocess.Popen(stream_cmd, stdin=subprocess.PIPE, stderr=sys.stderr)
 
     while True:
-        # Если очередь пуста, мы в беде. Но с ускоренным воркером этого быть не должно.
         if video_queue.empty():
             print("⚠️ BUFFER UNDERRUN! Waiting for worker...")
         
@@ -365,7 +364,7 @@ def streamer_thread():
         try:
             with open(seg_path, "rb") as f:
                 while True:
-                    chunk = f.read(65536) # Читаем кусками по 64кб
+                    chunk = f.read(65536) 
                     if not chunk:
                         break
                     process.stdin.write(chunk)
